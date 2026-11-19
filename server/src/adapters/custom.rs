@@ -81,12 +81,9 @@ impl Provider {
             _ => return Err("CUSTOM_OPENAI_TOOLS must be true or false.".into()),
         };
         let authorization = key_file.as_deref().map(read_key).transpose()?;
-        let client = Client::builder()
+        let client = crate::outbound_client()
             .connect_timeout(timeout("CUSTOM_OPENAI_CONNECT_TIMEOUT_SECONDS", 10)?)
             .timeout(timeout("CUSTOM_OPENAI_REQUEST_TIMEOUT_SECONDS", 180)?)
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
             .build()
             .map_err(|_| "Could not initialize the custom provider HTTP client.")?;
         Ok(Some(Self {
@@ -162,7 +159,7 @@ impl Provider {
             messages.push(json!({"role": "assistant", "content": turn.reply}));
         }
         messages.push(json!({"role": "user", "content": input.prompt}));
-        let tools = self.tools.then(tool_definitions);
+        let tools = self.tools.then(|| tool_definitions(input.mcp_available));
         let mut reply = String::new();
         let mut call_ids = HashSet::new();
 
@@ -425,16 +422,49 @@ impl Completion {
     }
 }
 
-fn tool_definitions() -> Vec<Value> {
-    [
-        ("remember", "Replace your own durable memory with the full updated Markdown.", &["markdown"][..]),
+fn tool_definitions(mcp_available: bool) -> Vec<Value> {
+    let built_in = [
+        (
+            "remember",
+            "Replace your own durable memory with the full updated Markdown.",
+            &["markdown"][..],
+        ),
         ("list_bots", "List the other Bots on this server.", &[][..]),
-        ("ask_bot", "Ask another Bot for help and return its reply.", &["bot", "message"][..]),
+        (
+            "ask_bot",
+            "Ask another Bot for help and return its reply.",
+            &["bot", "message"][..],
+        ),
         ("list_routines", "List your scheduled routines.", &[][..]),
-        ("add_routine", "Schedule a recurring task using five-field local-time cron.", &["name", "cron", "instruction"][..]),
-    ].into_iter().map(|(name, description, fields)| {
+        (
+            "add_routine",
+            "Schedule a recurring task using five-field local-time cron.",
+            &["name", "cron", "instruction"][..],
+        ),
+    ];
+    let managed = [
+        (
+            "list_mcp_services",
+            "List the MCP services available to this Bot.",
+            &[][..],
+        ),
+        (
+            "list_mcp_tools",
+            "List the tools and their argument schemas for an assigned MCP service ID.",
+            &["service"][..],
+        ),
+        (
+            "call_mcp_tool",
+            "Call a tool from an assigned MCP service using its advertised argument schema.",
+            &["service", "tool", "arguments"][..],
+        ),
+    ];
+    built_in.into_iter().chain(mcp_available.then_some(managed).into_iter().flatten()).map(|(name, description, fields)| {
         let properties: serde_json::Map<String, Value> =
-            fields.iter().map(|field| (field.to_string(), json!({"type": "string"}))).collect();
+            fields.iter().map(|field| {
+                let kind = if *field == "arguments" { "object" } else { "string" };
+                (field.to_string(), json!({"type": kind}))
+            }).collect();
         json!({"type": "function", "function": {
             "name": name, "description": description,
             "parameters": {"type": "object", "properties": properties, "required": fields, "additionalProperties": false}
@@ -456,6 +486,7 @@ async fn execute_tool(
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
     };
+    let mcp_arguments;
     let args: Vec<&str> = match (call.name.as_str(), arguments.len()) {
         ("remember", 1) => {
             let Some(markdown) = field("markdown").filter(|s| s.len() <= 32 * 1024) else {
@@ -486,16 +517,34 @@ async fn execute_tool(
             };
             vec!["routine", "add", name, cron, instruction]
         }
+        ("list_mcp_services", 0) if input.mcp_available => vec!["mcp", "services"],
+        ("list_mcp_tools", 1) if input.mcp_available => {
+            let Some(service) = field("service") else {
+                return "Provide an MCP service ID.".into();
+            };
+            vec!["mcp", "tools", service]
+        }
+        ("call_mcp_tool", 3) if input.mcp_available => {
+            let (Some(service), Some(tool), Some(args @ Value::Object(_))) =
+                (field("service"), field("tool"), arguments.get("arguments"))
+            else {
+                return "Provide a service ID, tool name and arguments object.".into();
+            };
+            mcp_arguments = args.to_string();
+            vec!["mcp", "call", service, tool, &mcp_arguments]
+        }
         _ => return "Unknown tool or invalid arguments.".into(),
     };
     emit(AgentEvent::Tool {
         name: call.name.replace('_', " "),
         detail: String::new(),
     });
-    let env = input
-        .env
-        .iter()
-        .filter(|(key, _)| matches!(key.as_str(), "BOT_API" | "BOT_ID" | "BOT_TOKEN"));
+    let env = input.env.iter().filter(|(key, _)| {
+        matches!(
+            key.as_str(),
+            "BOT_API" | "BOT_ID" | "BOT_TOKEN" | "BOT_MCP_TOKEN"
+        )
+    });
     let Ok(exe) = std::env::current_exe() else {
         return "Could not locate botctl.".into();
     };

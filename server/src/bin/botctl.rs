@@ -1,6 +1,6 @@
-//! `botctl`: the CLI Bots use for routines, other Bots, and handing their screen to the user. Works with any harness,
+//! `botctl`: the CLI Bots use for routines, peer messages, MCP and screen handoffs. Works with any CLI harness,
 //! because every harness can run a shell command. Talks to botd over local HTTP.
-//! No dependencies: a tiny HTTP/1.0 client over a TCP socket.
+//! Uses a local HTTP/1.0 connection over a TCP socket.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -14,6 +14,9 @@ const HELP: &str = r#"botctl: manage your routines (scheduled tasks).
   botctl bots                                      List all Bots
   botctl ask "<Bot name or id>" "<message>"        Ask another Bot; prints its reply
   botctl handoff "<what you need>"                 Ask the user to take over your screen; waits for "Done"
+  botctl mcp services                              List assigned MCP services
+  botctl mcp tools <service-id>                    List a service's tools and schemas
+  botctl mcp call <service-id> <tool> '<JSON>'      Call a tool using a JSON object
 
 Cron has 5 fields in the server's local time: minute hour day month weekday.
   "30 7 * * *"    every day at 07:30
@@ -26,8 +29,9 @@ Confirm the schedule with the user in plain words.
 If the other Bot takes longer, its reply arrives later as a new message."#;
 
 fn api(method: &str, path: &str, body: Option<String>) -> Result<String, String> {
-    let (Ok(base), Ok(token)) = (std::env::var("BOT_API"), std::env::var("BOT_TOKEN")) else {
-        return Err("botctl only works inside a Bot run (BOT_API and BOT_TOKEN are missing).".into());
+    let token_var = if path == "/api/mcp-runtime" { "BOT_MCP_TOKEN" } else { "BOT_TOKEN" };
+    let (Ok(base), Ok(token)) = (std::env::var("BOT_API"), std::env::var(token_var)) else {
+        return Err("botctl only works inside a Bot run.".into());
     };
     let addr = base.trim_start_matches("http://").trim_end_matches('/');
     let mut s = TcpStream::connect(addr).map_err(|e| format!("Can't reach the server: {e}"))?;
@@ -89,8 +93,20 @@ fn run(args: &[String]) -> Result<String, String> {
             let body = format!("{{\"from\":{},\"text\":{}}}", json_str(&bot), json_str(text));
             api("POST", "/api/handoff", Some(body))
         }
+        ["mcp", "services"] => mcp(serde_json::json!({"operation": "services"})),
+        ["mcp", "tools", service] => mcp(serde_json::json!({"operation": "tools", "service": service})),
+        ["mcp", "call", service, tool, arguments] => {
+            let Ok(args @ serde_json::Value::Object(_)) = serde_json::from_str(arguments) else {
+                return Err("MCP arguments must be a JSON object.".into());
+            };
+            mcp(serde_json::json!({"operation": "call", "service": service, "tool": tool, "arguments": args}))
+        }
         _ => Ok(HELP.into()),
     }
+}
+
+fn mcp(body: serde_json::Value) -> Result<String, String> {
+    api("POST", "/api/mcp-runtime", Some(body.to_string()))
 }
 
 fn main() {

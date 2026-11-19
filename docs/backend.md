@@ -7,6 +7,7 @@ One Rust server, `botd`. It serves the web app, stores Bot and chat records in S
 - **Bots** live in SQLite. Each Bot has a harness (`claude`, `codex`, `pi`, or `custom`), an optional model, and a CLI harness session id.
 - **Teams** group Bots in the sidebar. A Bot has one optional team assignment in SQLite. The sidebar remembers collapsed sections in the current browser.
 - **A message** is queued. Each Bot runs one task at a time, in order. Different Bots run in parallel.
+- **Pause** lets the current task finish and blocks new chats, scheduled routines, and delegated tasks. Queued messages stay in history and retire from the execution queue. Resuming accepts future work.
 - **A run** invokes the harness, streams its events, and saves each text block as a chat bubble.
 - **Live updates** go to the browser over one Server-Sent Events stream: new messages, streaming text, and what the Bot is doing ("Running: ls").
 - **Memory** is plain files, re-sent in the system prompt every run. The Bot edits them itself:
@@ -27,6 +28,7 @@ CLI adapters in `server/src/adapters/` build command lines and map JSON lines to
 - **Codex**: `codex exec --json`, then `codex exec resume <id>`. Instructions via `-c developer_instructions=...`. Codex only reads them when a session starts, so later memory edits reach it through the memory file.
 - **Pi**: `pi --mode json --session-dir <bot dir> --session-id <id>`. System prompt via `--append-system-prompt`.
 - **[Custom (OpenAI Compatible)](custom-provider.md)** uses streaming Chat Completions, stores recent conversation turns per Bot, and exposes a subset of SuperBot tools as functions.
+- **[Managed MCP services](mcp.md)** use server-side connections and per-Bot grants. CLI harnesses use `botctl mcp`. Custom Bots use function tools when configured.
 
 All three run with permission prompts off (`--dangerously-skip-permissions` and equivalents). The server is the computer, so treat it that way. Approvals are not built yet.
 
@@ -69,6 +71,7 @@ All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`.
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers. For `custom`, this returns the configured default model.
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
+- `PUT /api/bots/:id/pause` accepts `{paused}`. Paused Bots return 409 for new messages and delegation. A reply to an outstanding screen handoff can finish the active task.
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`
 - `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`
 - `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL

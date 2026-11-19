@@ -29,6 +29,7 @@ impl TempDir {
             model: None,
             effort: None,
             env: Default::default(),
+            mcp_available: false,
             state_dir: self.0.clone(),
         }
     }

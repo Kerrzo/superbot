@@ -38,7 +38,7 @@
           <div class="me-avatar" id="me-avatar"></div>
           <span id="me-name"></span>
         </div>
-        <button class="icon-btn" title="Apps">
+        <button type="button" class="icon-btn" id="mcp-open" title="MCP Services" aria-label="MCP Services">
           <svg viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M17 14v6M14 17h6"/></svg>
         </button>
       </div>
@@ -64,6 +64,10 @@
         <svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
       </button>
 
+      <div class="suggestions" id="suggestions" aria-label="Chat suggestions" hidden>
+        <button type="button" data-prefill="Set up a routine to ">Create a routine</button>
+        <button type="button" data-prefill="Your job: ">Give it a job</button>
+      </div>
       <form class="composer" id="composer">
         <button type="button" class="composer-plus" title="Attach">
           <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
@@ -72,7 +76,7 @@
         <button type="button" class="composer-mic" title="Voice note">
           <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
         </button>
-        <button type="submit" class="composer-voice" title="Send">
+        <button type="submit" class="composer-voice" title="Send" id="chat-send">
           <svg viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/></svg>
         </button>
       </form>
@@ -140,10 +144,45 @@
       </div>
     </form>
   </dialog>
+  <dialog class="modal team-dialog mcp-dialog" id="mcp-dialog" aria-labelledby="mcp-title">
+    <div class="modal-head">
+      <h3 id="mcp-title">MCP Services</h3>
+      <button type="button" class="modal-close" id="mcp-close" aria-label="Close MCP Services">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <p class="nb-error" id="mcp-error" role="alert" hidden></p>
+    <div id="mcp-catalogue">
+      <div class="mcp-list" id="mcp-list"></div>
+      <div class="modal-foot"><button type="button" class="nb-btn primary" id="mcp-add">Add service</button></div>
+    </div>
+    <form id="mcp-form" hidden autocomplete="off">
+      <div class="team-form-body mcp-fields">
+        <label for="mcp-name">Name</label><input id="mcp-name" maxlength="60" required />
+        <label for="mcp-transport">Transport</label>
+        <select id="mcp-transport"><option value="http">Streamable HTTP</option><option value="stdio">Local stdio</option></select>
+        <div class="mcp-fields" id="mcp-http">
+          <label for="mcp-url">Endpoint URL</label><input id="mcp-url" type="url" placeholder="https://example.com/mcp" />
+          <label for="mcp-bearer">Bearer credential file (optional)</label><input id="mcp-bearer" spellcheck="false" />
+        </div>
+        <div class="mcp-fields" id="mcp-stdio" hidden>
+          <label for="mcp-command">Executable</label><input id="mcp-command" spellcheck="false" />
+          <label for="mcp-args">Arguments, one per line</label><textarea id="mcp-args" rows="3" spellcheck="false"></textarea>
+          <label for="mcp-env">Credential files, one VARIABLE=filename per line</label><textarea id="mcp-env" rows="3" spellcheck="false"></textarea>
+        </div>
+        <label class="mcp-enabled"><input type="checkbox" id="mcp-enabled" /> Globally enabled</label>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="nb-btn" id="mcp-cancel">Cancel</button>
+        <button type="submit" class="nb-btn primary" id="mcp-save">Save service</button>
+      </div>
+    </form>
+  </dialog>
   <script src="vendor/marked.js"></script>
   <script src="vendor/purify.js"></script>
   <script src="vendor/highlight.js"></script>
   <script src="markdown.js"></script>
   <script src="app.js"></script>
+  <script src="mcp.js"></script>
 </body>
 </html>

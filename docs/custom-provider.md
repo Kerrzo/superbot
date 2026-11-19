@@ -33,6 +33,7 @@ Timeout values range from 1 to 3600 seconds. The existing `RUN_TIMEOUT_MINUTES` 
 
 - Each request includes the Bot's identity and current memory, shared user facts, and recent completed conversation turns. The custom provider retains up to 12 completed turns within a 256 KiB text budget. Small model context windows may need shorter messages.
 - Tool-capable models can update their own memory, list Bots, ask another Bot, and list or add routines. Tool messages are used within the current turn. Plain chat remains available with `CUSTOM_OPENAI_TOOLS=false`, with existing memory supplied as context.
+- Bots with an enabled MCP grant get functions for listing services, listing tool schemas, and calling tools. Grants are checked by SuperBot when the function executes. [Managed MCP setup](mcp.md)
 - The custom provider supports streamed text and OpenAI-style function calls. It has no shell or desktop tools, dedicated reasoning controls, or structured response mode. A model that cannot reliably emit function calls works best with tools disabled.
 - Errors appear in the Bot's chat. Stopped or failed requests do not retry on another provider.
 

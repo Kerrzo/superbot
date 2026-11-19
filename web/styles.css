@@ -264,6 +264,17 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .composer-plus { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; color: #aaa; background: #262626; }
 .composer-mic { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; color: #aaa; background: #262626; }
 .composer-voice { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; background: var(--blue); color: #fff; }
+.composer-voice:disabled { background: var(--bg-active); color: var(--text-dim); cursor: default; }
+.suggestions { position: absolute; left: 80px; right: 80px; bottom: 98px; max-width: 1240px; margin: 0 auto; display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.suggestions[hidden] { display: none; }
+.suggestions button { flex: none; padding: 4px 10px; border: 1px solid #414141; border-radius: 999px; color: var(--text-dim); font-size: 13px; white-space: nowrap; }
+.suggestions button:hover { color: var(--text); background: var(--bg-active); }
+.suggestions button:focus-visible { outline: 2px solid var(--blue-dot); outline-offset: -2px; }
+.chat:has(.suggestions:not([hidden])) .messages { padding-bottom: 175px; }
+.chat:has(.suggestions:not([hidden])) .model-bar { bottom: 133px; }
+.chat:has(.suggestions:not([hidden])) .scroll-down { bottom: 154px; }
+.paused-label { color: #e8b977; font-size: 12px; }
+.d-availability { margin-top: 18px; }
 .composer-plus:hover, .composer-mic:hover { color: #fff; }
 
 /* Branding: one faint line under the composer */
@@ -328,6 +339,21 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .team-dialog .modal-foot { padding-inline: 14px; gap: 8px; flex-wrap: wrap; }
 .team-dialog .nb-btn { padding: 7px 14px; font-size: 14px; }
 .team-delete { margin-right: auto; color: #f1b5b5; }
+.mcp-dialog { width: 530px; }
+.mcp-dialog > .nb-error { margin: 14px 24px 0; }
+.mcp-list { padding: 12px 24px; }
+.mcp-service { padding: 10px 0; }
+.mcp-service + .mcp-service { border-top: 1px solid var(--border); }
+.mcp-service-name { font-weight: 600; overflow-wrap: anywhere; }
+.mcp-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.mcp-actions button { padding: 4px 9px; border: 1px solid #404040; border-radius: 7px; font-size: 13px; }
+.mcp-actions button:hover { background: var(--bg-active); }
+.mcp-fields { display: grid; gap: 8px; }
+.mcp-fields[hidden] { display: none; }
+.mcp-fields :is(select, textarea) { width: 100%; padding: 8px 12px; background: var(--bg-main); color: var(--text); font: inherit; border: 1px solid #444; border-radius: 8px; }
+.mcp-fields textarea { resize: vertical; }
+.mcp-enabled { display: flex; align-items: center; gap: 8px; }
+.mcp-enabled input { width: auto; }
 .details select { min-width: 0; max-width: 65%; }
 .details select:focus-visible { outline: 2px solid var(--blue-dot); }
 
@@ -360,7 +386,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   .bot-row { gap: 6px; padding: 6px; }
   .bot-row .avatar { width: 32px !important; height: 32px !important; }
   .messages { padding-inline: clamp(8px, 3vw, 32px); }
-  .composer, .model-bar { left: 8px; right: 8px; }
+  .composer, .model-bar, .suggestions { left: 8px; right: 8px; }
   .composer input { min-width: 0; }
 }
 @media (max-width: 600px) {

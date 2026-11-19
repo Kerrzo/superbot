@@ -4,11 +4,12 @@
 mod adapters;
 mod cron;
 mod db;
+mod mcp;
 mod runner;
 mod screen;
 
 use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -47,6 +48,12 @@ pub fn short_id() -> String {
     random_bytes(4).iter().map(|x| format!("{x:02x}")).collect()
 }
 
+fn outbound_client() -> reqwest::ClientBuilder {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never()).no_proxy()
+}
+
 fn pick<'a>(a: &[&'a str]) -> &'a str {
     a[random_bytes(1)[0] as usize % a.len()]
 }
@@ -78,6 +85,8 @@ async fn main() {
 
     let abs = |p: String| std::path::absolute(p).expect("bad path");
     let data_dir = abs(env("DATA_DIR", "data"));
+    let mcp_secrets = std::env::var_os("MCP_SECRETS_DIR")
+        .map(PathBuf::from).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| data_dir.join("mcp-secrets"));
     let workspace = abs(env("WORKSPACE_DIR", "workspace"));
     std::fs::create_dir_all(&data_dir).expect("create DATA_DIR");
     std::fs::create_dir_all(&workspace).expect("create WORKSPACE_DIR");
@@ -95,6 +104,7 @@ async fn main() {
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
         custom,
+        mcp_secrets,
     }, screens);
 
     // First start: create the primary Bot.
@@ -116,16 +126,19 @@ async fn main() {
         .route("/bots/{id}/messages", get(list_messages).post(send_message))
         .route("/bots/{id}/read", post(mark_read))
         .route("/bots/{id}/stop", post(stop_bot))
+        .route("/bots/{id}/pause", axum::routing::put(pause_bot))
         .route("/bots/{id}/routines", get(list_routines).post(create_routine))
         .route("/routines/{id}", patch(update_routine).delete(delete_routine))
         .route("/bots/{id}/screen", get(screen_info))
         .route("/ask", post(ask))
-        .route("/handoff", post(handoff));
+        .route("/handoff", post(handoff))
+        .merge(mcp::admin_routes());
     let router = Router::new()
         .nest("/api", api)
         .fallback(get(web))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
+        .route("/api/mcp-runtime", post(mcp::runtime))
         .with_state(app.clone());
 
     app.recover();
@@ -191,15 +204,20 @@ async fn auth(State(app): State<AppState>, req: Request, next: Next) -> Response
     let password = PASSWORD.get().unwrap();
     let ok = password.is_empty()
         || h.strip_prefix("Bearer ").is_some_and(|t| same(t.as_bytes(), app.cfg.bot_token.as_bytes()))
-        || h.strip_prefix("Basic ").and_then(base64_decode).is_some_and(|creds| {
-            let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
-            same(pass, password.as_bytes())
-        });
+        || operator_password(req.headers());
     if ok {
         next.run(req).await
     } else {
         (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Bots\"")], "Login required").into_response()
     }
+}
+
+fn operator_password(headers: &HeaderMap) -> bool {
+    let password = PASSWORD.get().unwrap();
+    !password.is_empty() && headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic ")).and_then(base64_decode).is_some_and(|creds| {
+            creds.splitn(2, |b| *b == b':').nth(1).is_some_and(|pass| same(pass, password.as_bytes()))
+        })
 }
 
 /// Constant-time comparison.
@@ -230,6 +248,7 @@ async fn web(uri: axum::http::Uri) -> Response {
         "/app.js" => ("app.js", include_str!("../../web/app.js")),
         "/styles.css" => ("styles.css", include_str!("../../web/styles.css")),
         "/markdown.js" => ("markdown.js", include_str!("../../web/markdown.js")),
+        "/mcp.js" => ("mcp.js", include_str!("../../web/mcp.js")),
         "/vendor/marked.js" => ("vendor/marked.js", include_str!("../../web/vendor/marked.js")),
         "/vendor/purify.js" => ("vendor/purify.js", include_str!("../../web/vendor/purify.js")),
         "/vendor/highlight.js" => ("vendor/highlight.js", include_str!("../../web/vendor/highlight.js")),
@@ -447,6 +466,23 @@ async fn stop_bot(State(app): State<AppState>, Path(id): Path<String>) -> Res {
     Ok(Json(json!({ "ok": true })))
 }
 
+fn paused() -> ApiError {
+    ApiError(StatusCode::CONFLICT, "This Bot is paused. Resume it before sending new work.".into())
+}
+
+async fn pause_bot(State(app): State<AppState>, Path(id): Path<String>, headers: HeaderMap, Json(v): Json<Value>) -> Res {
+    let local_operator = PASSWORD.get().unwrap().is_empty() && !headers.contains_key(header::AUTHORIZATION);
+    if !local_operator && !operator_password(&headers) {
+        return Err(ApiError(StatusCode::FORBIDDEN, "Only the operator can pause or resume a Bot.".into()));
+    }
+    let value = v["paused"].as_bool().ok_or_else(|| bad("paused must be true or false"))?;
+    if !app.pause(&id, value).map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Could not save Bot availability".into()))? {
+        return Err(not_found("Bot"));
+    }
+    app.push_bot(&id);
+    Ok(Json(app.bot_view(&need_bot(&app, &id)?)))
+}
+
 // Messages
 
 async fn list_messages(State(app): State<AppState>, Path(id): Path<String>) -> Res {
@@ -458,23 +494,27 @@ async fn send_message(State(app): State<AppState>, Path(id): Path<String>, Json(
     need_bot(&app, &id)?;
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Text is required"))?;
     let text: String = text.chars().take(100_000).collect();
-    // Answering a choice card: remember which option was picked.
-    if let (Some(mid), Some(opt)) = (v["answer"]["messageId"].as_i64(), v["answer"]["option"].as_u64()) {
-        if let Some(mut q) = app.db.message(mid).filter(|m| m.bot_id == id).and_then(|m| m.question) {
+    let card = v["answer"]["messageId"].as_i64().and_then(|mid| app.db.message(mid)).filter(|m| m.bot_id == id);
+    let pick = || {
+        if let (Some(card), Some(opt)) = (&card, v["answer"]["option"].as_u64())
+            && let Some(mut q) = card.question.clone()
+        {
             q["picked"] = json!(opt);
-            app.db.set_question(mid, &q);
+            app.db.set_question(card.id, &q);
         }
-    }
+    };
     // Answering a handoff card the Bot is still waiting on: hand the answer to it directly.
-    if let Some(tx) = v["answer"]["messageId"].as_i64().and_then(|mid| app.take_handoff(mid)) {
+    if let Some(tx) = card.as_ref().and_then(|card| app.take_handoff(card.id)) {
+        pick();
         let msg = app.db.add_message(&id, "user", &text, None, false, Some("done"));
         app.push_message(&msg);
         let _ = tx.send(text);
         return Ok((StatusCode::ACCEPTED, Json(json!(msg))));
     }
-    let msg = app.db.add_message(&id, "user", &text, None, false, Some("queued"));
-    app.push_message(&msg);
-    app.enqueue(msg.clone());
+    let msg = app.submit(&id, || {
+        pick();
+        app.db.add_message(&id, "user", &text, None, false, Some("queued"))
+    }).ok_or_else(paused)?;
     Ok((StatusCode::ACCEPTED, Json(json!(msg))))
 }
 
@@ -494,7 +534,7 @@ async fn ask(State(app): State<AppState>, Json(v): Json<Value>) -> Result<String
     }
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Message is required"))?;
     let wait = Duration::from_secs(9 * 60); // under the 10 minute max most harnesses allow a command
-    Ok(match app.ask(&from, to, text, wait).await {
+    Ok(match app.ask(&from, to, text, wait).await.map_err(|_| paused())? {
         Some(reply) => reply,
         None => format!("{} is still working on it. Their reply will arrive later as a new message.", to.name),
     })

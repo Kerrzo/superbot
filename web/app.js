@@ -95,7 +95,7 @@ function renderBotRow(b) {
   return `<button class="bot-row ${b.id === activeId ? "active" : ""}" data-id="${b.id}"${b.id === activeId ? ' aria-current="true"' : ""}>
     ${avatar(b.color, b.shape, 52)}
     <div class="meta"><div class="name">${esc(b.name)}</div>
-      <div class="preview">${b.working ? `<em>${esc(b.status || "Working")}…</em>` : esc(b.preview || "")}</div></div>
+      <div class="preview">${b.paused ? `<em>${b.working ? "Paused · finishing current task" : "Paused"}</em>` : b.working ? `<em>${esc(b.status || "Working")}…</em>` : esc(b.preview || "")}</div></div>
     ${b.unread && b.id !== activeId ? '<span class="unread"></span>' : ""}
   </button>`;
 }
@@ -281,13 +281,15 @@ function updateConversationScroll(keepScroll, draw) {
 function renderChat(keepScroll) {
   const b = bot(activeId);
   if (!b) return;
-  $("bot-pill").innerHTML = `${avatar(b.color, b.shape, 30)}<span>${esc(b.name)}</span><span class="harness">${esc(b.harness === "custom" ? HARNESS_NAMES.custom : b.harness)}</span>`;
-  $("input").placeholder = `Message ${b.name}`;
+  $("bot-pill").innerHTML = `${avatar(b.color, b.shape, 30)}<span>${esc(b.name)}</span><span class="harness">${esc(b.harness === "custom" ? HARNESS_NAMES.custom : b.harness)}</span>${b.paused ? '<span class="paused-label">Paused</span>' : ""}`;
+  $("input").placeholder = b.paused ? `${b.name} is paused` : `Message ${b.name}`;
+  $("input").disabled = $("chat-send").disabled = Boolean(b.paused);
   updateConversationScroll(keepScroll, () => {
+    $("suggestions").hidden = b.paused || b.working;
     renderHistory(b);
     renderDraft(b);
     $("chat-progress").hidden = !b.working;
-    $("chat-status").textContent = b.status || "Working";
+    $("chat-status").textContent = b.paused ? "Finishing current task" : b.status || "Working";
   });
 }
 
@@ -327,6 +329,7 @@ async function sendText(text, answer) {
   if (!b || !text) return;
   try {
     await api("POST", `/api/bots/${b.id}/messages`, { text, answer });
+    return true;
   } catch (err) {
     alert(err.message);
   }
@@ -602,20 +605,33 @@ $("messages").addEventListener("click", (e) => {
   const card = opt.closest(".question");
   const m = messages[activeId]?.find((x) => x.id === +card.dataset.id);
   if (!m || m.question.picked != null) return;
-  m.question.picked = +opt.dataset.k;
-  render(true);
-  sendText(m.question.options[m.question.picked], { messageId: m.id, option: m.question.picked });
+  const option = +opt.dataset.k;
+  opt.disabled = true;
+  sendText(m.question.options[option], { messageId: m.id, option }).then((sent) => {
+    opt.disabled = false;
+    if (sent) { m.question.picked = option; render(true); }
+  });
 });
 
 document.addEventListener("selectionchange", () => { if (draftWaiting) scheduleDraft(); });
 $("chat-draft").addEventListener("focusout", () => { if (draftWaiting) scheduleDraft(); });
 
+$("suggestions").addEventListener("click", (e) => {
+  const button = e.target.closest("[data-prefill]");
+  if (button && !$("input").disabled) {
+    $("input").value = button.dataset.prefill;
+    $("input").focus();
+  }
+});
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
-  const text = $("input").value.trim();
-  if (!text) return;
+  const value = $("input").value;
+  if (!value.trim() || $("input").disabled) return;
   $("input").value = "";
-  sendText(text);
+  const id = activeId;
+  sendText(value.trim()).then((sent) => {
+    if (!sent && activeId === id && !$("input").value) $("input").value = value;
+  });
 });
 
 // New Bot window
@@ -684,9 +700,8 @@ $("nb-form").addEventListener("submit", async (e) => {
 
 // Bot details: a right-hand panel, opened by clicking the name at the top of the chat.
 const ICONS = {
-  clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
-  job: '<svg viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="12" rx="2"/><path d="M9 7V5.5A1.5 1.5 0 0 1 10.5 4h3A1.5 1.5 0 0 1 15 5.5V7"/></svg>',
-  chevron: '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>',
+  pause: '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 5v14m6-14v14"/></svg>',
+  resume: '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="m8 5 12 7-12 7z"/></svg>',
   trash: '<svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg>',
 };
 const details = { open: false, tab: "activity", routines: [] };
@@ -695,9 +710,13 @@ async function openDetails() {
   details.open = true;
   if (!$("screen").hidden) closeScreen(); // one right-hand panel at a time
   details.routines = [];
+  const id = activeId;
   renderDetails();
-  try { details.routines = await api("GET", `/api/bots/${activeId}/routines`); } catch {}
-  renderDetails();
+  if (details.tab === "settings") loadMcpGrants(id);
+  try {
+    const routines = await api("GET", `/api/bots/${id}/routines`);
+    if (activeId === id) { details.routines = routines; renderDetails(); }
+  } catch {}
 }
 function closeDetails() { details.open = false; renderDetails(); }
 
@@ -713,11 +732,6 @@ function renderDetails() {
         ${toggle(r.enabled, `data-routine="${r.id}" title="${r.enabled ? "Pause" : "Resume"}"`)}</div>`).join("")
     : `<div class="d-item d-empty">No routines yet.</div>`;
   const activity = `
-    <div class="d-section"><span>Suggested</span></div>
-    <div class="d-card">
-      <button class="d-item d-link" data-prefill="Set up a routine to ">${ICONS.clock}<span>Create a routine</span>${ICONS.chevron}</button>
-      <button class="d-item d-link" data-prefill="Your job: ">${ICONS.job}<span>Give it a job</span>${ICONS.chevron}</button>
-    </div>
     <div class="d-section"><span>Routines</span></div>
     <div class="d-card">${routines}</div>
     <div class="d-section"><span>Computer</span></div>
@@ -736,7 +750,12 @@ function renderDetails() {
           `<option value="${team.id}" ${team.id === b.teamId ? "selected" : ""}>${esc(team.name)}</option>`).join("")}</select></label>
       <div class="d-item"><span class="d-text">Hide from sidebar</span>${toggle(b.hidden, 'id="d-hide"')}</div>
     </div>
-    ${b.primary ? "" : `<div class="d-card"><button class="d-item d-link d-danger" id="d-delete">${ICONS.trash}<span>Delete Bot</span></button></div>`}`;
+    <div class="d-section"><span>MCP Services</span></div>
+    <div class="d-card" id="mcp-grants">${renderMcpGrants(b.id)}</div>
+    <div class="d-card d-availability">
+      <button type="button" class="d-item d-link" id="d-pause">${b.paused ? ICONS.resume : ICONS.pause}<span>${b.paused ? "Resume Bot" : "Pause Bot"}</span></button>
+      ${b.primary ? "" : `<button class="d-item d-link d-danger" id="d-delete">${ICONS.trash}<span>Delete Bot</span></button>`}
+    </div>`;
   el.innerHTML = `
     <button class="d-close" id="d-close" title="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
     <div class="d-hero">${avatar(b.color, b.shape, 120)}
@@ -758,8 +777,20 @@ $("details").addEventListener("click", async (e) => {
   const t = e.target.closest("button");
   if (!t) return;
   if (t.id === "d-close") return closeDetails();
-  if (t.dataset.tab) { details.tab = t.dataset.tab; return renderDetails(); }
-  if (t.dataset.prefill) { $("input").value = t.dataset.prefill; $("input").focus(); return; }
+  if (t.dataset.tab) {
+    details.tab = t.dataset.tab;
+    renderDetails();
+    if (details.tab === "settings") loadMcpGrants(activeId);
+    return;
+  }
+  if (t.dataset.mcpGrant) return toggleMcpGrant(activeId, t.dataset.mcpGrant);
+  if (t.id === "d-pause") {
+    const b = bot(activeId);
+    t.disabled = true;
+    try { upsertBot(await api("PUT", `/api/bots/${b.id}/pause`, { paused: !b.paused })); render(true); $("d-pause")?.focus(); }
+    catch (err) { t.disabled = false; alert(err.message); }
+    return;
+  }
   if (t.id === "d-hide") return patchBot({ hidden: !bot(activeId).hidden });
   if (t.dataset.routine) {
     const r = details.routines.find((x) => x.id === t.dataset.routine);
@@ -792,7 +823,7 @@ $("details").addEventListener("focusout", (e) => {
   if (name && name !== bot(activeId)?.name) patchBot({ name });
   else e.target.value = bot(activeId)?.name ?? "";
 });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && details.open && $("nb").hidden && !$("team-dialog").open) closeDetails(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && details.open && $("nb").hidden && !$("team-dialog").open && !$("mcp-dialog").open) closeDetails(); });
 
 $("hidden-btn").addEventListener("click", () => { showHidden = !showHidden; renderSidebar(); });
 $("search-btn").addEventListener("click", () => {

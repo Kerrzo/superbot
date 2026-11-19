@@ -37,6 +37,7 @@ pub struct RunInput {
     /// Reasoning effort, in the harness's own words (e.g. "high").
     pub effort: Option<String>,
     pub env: HashMap<String, String>,
+    pub mcp_available: bool,
     /// A private folder for this Bot's harness files.
     pub state_dir: PathBuf,
 }
@@ -136,6 +137,8 @@ pub async fn run(
         .args(&args)
         .current_dir(&input.cwd)
         .envs(&input.env)
+        .env_remove("AUTH_PASSWORD")
+        .env_remove("MCP_SECRETS_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

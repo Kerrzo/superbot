@@ -64,11 +64,7 @@ pub fn start(app: Arc<App>) {
                 if !r.enabled || r.last_run_at.is_some_and(|t| t / 60_000 == minute) || !matches(&r.cron, &now) {
                     continue;
                 }
-                app.db.routine_ran(&r.id, now.timestamp_millis());
-                let text = format!("{}: {}", r.name, r.instruction);
-                let msg = app.db.add_message(&r.bot_id, "routine", &text, None, false, Some("queued"));
-                app.push_message(&msg);
-                app.enqueue(msg);
+                app.dispatch_routine(&r, now.timestamp_millis());
             }
         }
     });

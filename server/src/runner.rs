@@ -2,7 +2,7 @@
 //! (identity, rules, memory), streams harness events to the web app, and saves replies.
 
 use crate::adapters::{self, AbortReason, AgentEvent, RunInput};
-use crate::db::{Bot, BotPatch, Db, Message};
+use crate::db::{Bot, BotPatch, Db, Message, Routine};
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -23,12 +23,14 @@ pub struct Config {
     pub run_timeout: Duration,
     pub default_harness: String,
     pub custom: Option<adapters::custom::Provider>,
+    pub mcp_secrets: PathBuf,
 }
 
 struct Run {
     abort: watch::Sender<AbortReason>,
     status: String,
     draft: String,
+    mcp_token: String,
 }
 
 #[derive(Default)]
@@ -45,7 +47,9 @@ pub struct App {
     pub tx: broadcast::Sender<String>,
     /// Each Bot's screen. None when this server has no display tools.
     pub screens: Option<Screens>,
+    pub mcp_http: reqwest::Client,
     bots: Mutex<HashMap<String, BotState>>,
+    dispatch: Mutex<()>,
     /// Bots waiting on `botctl ask` or `botctl handoff`, by the message's id.
     waiters: Mutex<HashMap<i64, oneshot::Sender<String>>>,
     closing: AtomicBool,
@@ -53,7 +57,8 @@ pub struct App {
 
 impl App {
     pub fn new(db: Db, cfg: Config, screens: Option<Screens>) -> Arc<App> {
-        Arc::new(App { db, cfg, tx: broadcast::channel(1024).0, screens, bots: Mutex::default(), waiters: Mutex::default(), closing: AtomicBool::new(false) })
+        let mcp_http = crate::outbound_client().connect_timeout(Duration::from_secs(10)).build().expect("initialize MCP HTTP client");
+        Arc::new(App { db, cfg, tx: broadcast::channel(1024).0, screens, mcp_http, bots: Mutex::default(), dispatch: Mutex::default(), waiters: Mutex::default(), closing: AtomicBool::new(false) })
     }
 
     pub fn is_running(&self, bot_id: &str) -> bool {
@@ -77,7 +82,7 @@ impl App {
         });
         let mut v = json!({
             "id": b.id, "name": b.name, "color": b.color, "shape": b.shape, "harness": b.harness, "model": b.model, "effort": b.effort,
-            "primary": b.primary, "hidden": b.hidden, "unread": b.unread, "teamId": b.team_id, "preview": preview.unwrap_or_default(), "working": false,
+            "primary": b.primary, "hidden": b.hidden, "unread": b.unread, "teamId": b.team_id, "paused": b.paused, "preview": preview.unwrap_or_default(), "working": false,
         });
         if let Some(run) = self.state().get(&b.id).and_then(|s| s.run.as_ref()) {
             v["working"] = json!(true);
@@ -120,7 +125,48 @@ impl App {
         }
     }
 
-    pub fn enqueue(self: &Arc<Self>, msg: Message) {
+    pub fn submit(self: &Arc<Self>, bot_id: &str, create: impl FnOnce() -> Message) -> Option<Message> {
+        let _dispatch = self.dispatch.lock().unwrap();
+        if !self.db.bot(bot_id).is_some_and(|b| !b.paused) { return None; }
+        let msg = create();
+        self.push_message(&msg);
+        self.enqueue(msg.clone());
+        Some(msg)
+    }
+
+    pub fn dispatch_routine(self: &Arc<Self>, routine: &Routine, at: i64) {
+        self.submit(&routine.bot_id, || {
+            self.db.routine_ran(&routine.id, at);
+            let text = format!("{}: {}", routine.name, routine.instruction);
+            self.db.add_message(&routine.bot_id, "routine", &text, None, false, Some("queued"))
+        });
+    }
+
+    pub fn pause(&self, bot_id: &str, paused: bool) -> rusqlite::Result<bool> {
+        let _dispatch = self.dispatch.lock().unwrap();
+        let found = self.db.set_paused(bot_id, paused)?;
+        if found && paused {
+            if let Some(s) = self.state().get_mut(bot_id) {
+                for msg in s.queue.drain(..) { self.reject_peer(msg.id); }
+            }
+        }
+        Ok(found)
+    }
+
+    fn reject_peer(&self, msg: i64) {
+        if let Some(waiter) = self.waiters.lock().unwrap().remove(&msg) {
+            let _ = waiter.send("The Bot was paused before starting this task.".into());
+        }
+    }
+
+    pub fn mcp_bot(&self, token: &str) -> Option<String> {
+        self.state().iter().find_map(|(id, state)| {
+            let run = state.run.as_ref()?;
+            (run.abort.borrow().is_none() && crate::same(run.mcp_token.as_bytes(), token.as_bytes())).then(|| id.clone())
+        })
+    }
+
+    fn enqueue(self: &Arc<Self>, msg: Message) {
         let bot_id = msg.bot_id.clone();
         let mut st = self.state();
         let s = st.entry(bot_id.clone()).or_default();
@@ -147,30 +193,32 @@ impl App {
             };
             let Some(msg) = next else { break };
             let before = self.db.last_id();
-            if let Some(bot) = self.db.bot(&bot_id) {
-                self.run_one(bot, &msg).await;
-            }
+            let started = match self.db.bot(&bot_id) {
+                Some(bot) => self.run_one(bot, &msg).await,
+                None => false,
+            };
             if self.closing.load(Ordering::SeqCst) {
                 return; // left "running": the next start reports it
             }
             self.db.set_status(msg.id, "done");
             if msg.role == "peer" {
-                self.answer_peer(&msg, before);
+                if started { self.answer_peer(&msg, before); } else { self.reject_peer(msg.id); }
             }
         }
         self.send(json!({ "type": "status", "botId": bot_id, "working": false }));
     }
 
-    async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) {
+    async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) -> bool {
         let is_custom = bot.harness == adapters::custom::NAME;
         if is_custom && self.cfg.custom.is_none() {
-            return self.say(&bot.id, "Custom (OpenAI Compatible) is not configured on this server.", true);
+            self.say(&bot.id, "Custom (OpenAI Compatible) is not configured on this server.", true);
+            return true;
         }
         if !is_custom && adapters::get(&bot.harness).is_none() {
-            return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
+            self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
+            return true;
         }
         self.init_bot_files(&bot);
-        self.db.set_status(msg.id, "running");
         let from = || msg.from_bot.as_deref().and_then(|id| self.db.bot(id)).map(|b| format!("{} (id {})", b.name, b.id)).unwrap_or("another Bot".into());
         let prompt = match msg.role.as_str() {
             "routine" => format!("(Scheduled routine) {}", msg.text),
@@ -181,8 +229,16 @@ impl App {
 
         for attempt in 0..2 {
             let (abort_tx, abort_rx) = watch::channel(None);
-            self.state().entry(bot.id.clone()).or_default().run =
-                Some(Run { abort: abort_tx.clone(), status: "Thinking".into(), draft: String::new() });
+            let mcp_token = crate::random_bytes(32).iter().map(|b| format!("{b:02x}")).collect::<String>();
+            {
+                let _dispatch = self.dispatch.lock().unwrap();
+                if !self.db.bot(&bot.id).is_some_and(|b| !b.paused) || (attempt == 0 && !self.db.claim_message(msg.id)) {
+                    return attempt > 0;
+                }
+                self.state().entry(bot.id.clone()).or_default().run = Some(Run {
+                    abort: abort_tx.clone(), status: "Thinking".into(), draft: String::new(), mcp_token: mcp_token.clone(),
+                });
+            }
             self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": "Thinking" }));
             let timeout = self.cfg.run_timeout;
             let timer = tokio::spawn(async move {
@@ -194,6 +250,7 @@ impl App {
                 ("BOT_ID".to_string(), bot.id.clone()),
                 ("BOT_API".to_string(), self.cfg.api_url.clone()),
                 ("BOT_TOKEN".to_string(), self.cfg.bot_token.clone()),
+                ("BOT_MCP_TOKEN".to_string(), mcp_token),
             ]);
             let path = std::env::var("PATH").unwrap_or_default();
             env.insert("PATH".into(), format!("{}:{path}", self.cfg.bin_dir.display()));
@@ -202,14 +259,19 @@ impl App {
             {
                 env.extend(screen::bot_env(&info, &bot.id, &self.bot_dir(&bot.id)));
             }
+            let mcp_available = self.db.has_mcp(&bot.id);
+            let prompt = if mcp_available && !is_custom {
+                format!("(SuperBot tools: Use {} mcp services to discover your assigned MCP services, then mcp tools <service-id> and mcp call <service-id> <tool> '<JSON object>'.)\n\n{prompt}", self.cfg.bin_dir.join("botctl").display())
+            } else { prompt.clone() };
             let input = RunInput {
-                prompt: prompt.clone(),
+                prompt,
                 system: self.system_prompt(&bot),
                 session_id: bot.session_id.clone(),
                 cwd: self.cfg.workspace.clone(),
                 model: bot.model.clone(),
                 effort: bot.effort.clone(),
                 env,
+                mcp_available,
                 state_dir: self.bot_dir(&bot.id),
             };
 
@@ -275,8 +337,9 @@ impl App {
                 _ if replies == 0 => self.say(&id, "Done.", false),
                 _ => {}
             }
-            return;
+            return true;
         }
+        unreachable!("there is at most one retry")
     }
 
     fn with_run<T: Default>(&self, bot_id: &str, f: impl FnOnce(&mut Run) -> T) -> T {
@@ -285,17 +348,18 @@ impl App {
 
     /// Another Bot asks this one something. Resolves with the reply, or None if it
     /// takes longer than `wait`; then the reply is delivered to the asker later.
-    pub async fn ask(self: &Arc<Self>, from: &Bot, to: &Bot, text: &str, wait: Duration) -> Option<String> {
-        let msg = self.db.add_message_from(&to.id, "peer", text, None, false, Some("queued"), Some(&from.id));
+    pub async fn ask(self: &Arc<Self>, from: &Bot, to: &Bot, text: &str, wait: Duration) -> Result<Option<String>, ()> {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().unwrap().insert(msg.id, tx);
-        self.push_message(&msg);
-        self.enqueue(msg.clone());
+        let msg = self.submit(&to.id, || {
+            let msg = self.db.add_message_from(&to.id, "peer", text, None, false, Some("queued"), Some(&from.id));
+            self.waiters.lock().unwrap().insert(msg.id, tx);
+            msg
+        }).ok_or(())?;
         let reply = tokio::time::timeout(wait, rx).await.ok().and_then(Result::ok);
         if reply.is_none() {
             self.waiters.lock().unwrap().remove(&msg.id);
         }
-        reply
+        Ok(reply)
     }
 
     /// The Bot needs the user on its screen (a login, 2FA, a CAPTCHA). Posts a card
@@ -333,9 +397,10 @@ impl App {
         };
         if let Some(reply) = unsent {
             let Some(asker) = msg.from_bot.as_deref().filter(|id| self.db.bot(id).is_some()) else { return };
-            let m = self.db.add_message_from(asker, "reply", &reply, None, false, Some("queued"), Some(&msg.bot_id));
-            self.push_message(&m);
-            self.enqueue(m);
+            if self.submit(asker, || self.db.add_message_from(asker, "reply", &reply, None, false, Some("queued"), Some(&msg.bot_id))).is_none() {
+                let m = self.db.add_message_from(asker, "reply", &reply, None, false, Some("done"), Some(&msg.bot_id));
+                self.push_message(&m);
+            }
         }
     }
 
@@ -378,12 +443,12 @@ impl App {
     /// re-run, because re-running could repeat actions like sending an email.
     pub fn recover(self: &Arc<Self>) {
         for m in self.db.pending() {
-            if self.db.bot(&m.bot_id).is_none() {
-                continue;
-            }
+            let Some(bot) = self.db.bot(&m.bot_id) else { continue };
             if m.status.as_deref() == Some("running") {
                 self.db.set_status(m.id, "done");
                 self.say(&m.bot_id, "A server restart interrupted me before I finished. Send it again if you still need it.", true);
+            } else if bot.paused {
+                self.db.set_status(m.id, "done");
             } else {
                 self.enqueue(m);
             }

@@ -16,6 +16,7 @@ pub struct Bot {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub team_id: Option<String>,
+    pub paused: bool,
     #[serde(skip)]
     pub session_id: Option<String>,
     pub primary: bool,
@@ -92,6 +93,7 @@ fn bot_row(r: &Row) -> rusqlite::Result<Bot> {
         model: r.get("model")?,
         effort: r.get("effort")?,
         team_id: r.get("team_id")?,
+        paused: r.get("paused")?,
         session_id: r.get("session_id")?,
         primary: r.get("primary_bot")?,
         hidden: r.get("hidden")?,
@@ -171,6 +173,15 @@ impl Db {
               enabled INTEGER NOT NULL DEFAULT 1,
               last_run_at INTEGER,
               created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mcp_services (
+              id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL,
+              connection TEXT NOT NULL, revision TEXT NOT NULL, status TEXT, tested_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS bot_mcp (
+              bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+              service_id TEXT NOT NULL REFERENCES mcp_services(id) ON DELETE CASCADE,
+              PRIMARY KEY (bot_id, service_id)
             );",
         )?;
         // Added after the first release; fails harmlessly if it already exists.
@@ -184,11 +195,17 @@ impl Db {
             migration.execute("ALTER TABLE bots ADD COLUMN team_id TEXT REFERENCES teams(id) ON DELETE RESTRICT", [])?;
         }
         migration.execute("CREATE INDEX IF NOT EXISTS bots_team ON bots(team_id)", [])?;
+        let has_pause: bool = migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name = 'paused')", [], |r| r.get(0),
+        )?;
+        if !has_pause {
+            migration.execute("ALTER TABLE bots ADD COLUMN paused INTEGER NOT NULL DEFAULT 0", [])?;
+        }
         migration.commit()?;
         Ok(Db(Mutex::new(c)))
     }
 
-    fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -318,6 +335,21 @@ impl Db {
 
     pub fn set_status(&self, id: i64, status: &str) {
         self.c().execute("UPDATE messages SET status = ? WHERE id = ?", params![status, id]).unwrap();
+    }
+
+    pub fn claim_message(&self, id: i64) -> bool {
+        self.c().execute("UPDATE messages SET status = 'running' WHERE id = ? AND status = 'queued'", [id]).unwrap() != 0
+    }
+
+    pub fn set_paused(&self, bot: &str, paused: bool) -> rusqlite::Result<bool> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let found = tx.execute("UPDATE bots SET paused = ? WHERE id = ?", params![paused, bot])? != 0;
+        if paused && found {
+            tx.execute("UPDATE messages SET status = 'done' WHERE bot_id = ? AND status = 'queued'", [bot])?;
+        }
+        tx.commit()?;
+        Ok(found)
     }
 
     pub fn set_question(&self, id: i64, q: &Value) {
