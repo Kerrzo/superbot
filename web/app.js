@@ -50,27 +50,6 @@ function avatar(color, shape = "waddle", size = 48, ring = false) {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-// Small, safe Markdown: escape first, then add formatting.
-function md(src) {
-  const blocks = [];
-  let s = esc(src).replace(/```[^\n]*\n([\s\S]*?)```/g, (_, code) => `\u0000${blocks.push(code) - 1}\u0000`);
-  const inline = (t) => t
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
-    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
-  return s.split(/\n{2,}/).map((para) => {
-    const lines = para.split("\n");
-    if (/^\u0000\d+\u0000$/.test(para.trim())) return para.trim();
-    if (lines.every((l) => /^\s*[-*] /.test(l))) return `<ul>${lines.map((l) => `<li>${inline(l.replace(/^\s*[-*] /, ""))}</li>`).join("")}</ul>`;
-    if (lines.every((l) => /^\s*\d+[.)] /.test(l))) return `<ol>${lines.map((l) => `<li>${inline(l.replace(/^\s*\d+[.)] /, ""))}</li>`).join("")}</ol>`;
-    const h = para.match(/^#{1,4} (.*)$/);
-    if (h && lines.length === 1) return `<p><strong>${inline(h[1])}</strong></p>`;
-    return `<p>${lines.map(inline).join("<br>")}</p>`;
-  }).join("").replace(/\u0000(\d+)\u0000/g, (_, i) => `<pre><code>${blocks[i]}</code></pre>`);
-}
-
 async function api(method, path, body) {
   const res = await fetch(path, {
     method,
@@ -87,6 +66,7 @@ let me = { name: "" };
 let harnesses = [];
 let defaultHarness = "claude";
 let bots = [];
+let teams = [];
 const messages = {}; // botId -> array, loaded on first open
 const drafts = {}; // botId -> streaming text
 let activeId = localStorage.getItem("activeBot");
@@ -101,7 +81,42 @@ function upsertBot(b) {
   if (i >= 0) bots[i] = { ...bots[i], ...b }; else bots.push(b);
 }
 
+function upsertTeam(team) {
+  teams = teams.filter((t) => t.id !== team.id);
+  teams.push(team);
+  teams.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+}
+
 // Sidebar
+const collapsePrefix = "superbot.team.collapsed.";
+let sidebarContent;
+
+function renderBotRow(b) {
+  return `<button class="bot-row ${b.id === activeId ? "active" : ""}" data-id="${b.id}"${b.id === activeId ? ' aria-current="true"' : ""}>
+    ${avatar(b.color, b.shape, 52)}
+    <div class="meta"><div class="name">${esc(b.name)}</div>
+      <div class="preview">${b.working ? `<em>${esc(b.status || "Working")}…</em>` : esc(b.preview || "")}</div></div>
+    ${b.unread && b.id !== activeId ? '<span class="unread"></span>' : ""}
+  </button>`;
+}
+
+function renderTeamSection(id, name, members, searching) {
+  const expanded = searching || localStorage.getItem(collapsePrefix + id) !== "true";
+  const teamsActions = id === "unassigned" ? "" : `<button type="button" class="team-icon" data-team-edit="${id}"
+    title="Manage ${esc(name)}" aria-label="Manage ${esc(name)}"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 12h.01m7 0h.01m7 0h.01"/></svg></button>`;
+  return `<section class="team-section" aria-label="${esc(name)}">
+    <div class="team-bar">
+      <button type="button" class="team-toggle" data-team-toggle="${id}" aria-expanded="${expanded}" aria-controls="team-members-${id}" ${searching ? "disabled" : ""}>
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg>
+        <span>${esc(name)}</span>
+        ${!expanded && members.some((b) => b.unread && b.id !== activeId) ? '<span class="team-unread" aria-label="Unread messages"></span>' : ""}
+      </button>
+      ${teamsActions}
+    </div>
+    <div class="team-members" id="team-members-${id}" ${expanded ? "" : "hidden"}>${members.map(renderBotRow).join("")}</div>
+  </section>`;
+}
+
 function renderSidebar() {
   const p = primary();
   $("primary-bot").innerHTML = p ? `<div class="avatar-wrap">${avatar(p.color, p.shape, 82)}
@@ -111,14 +126,26 @@ function renderSidebar() {
   $("primary-bot").classList.toggle("active", p?.id === activeId);
 
   const q = filter.toLowerCase();
-  const list = bots.filter((b) => !b.primary && b.hidden === showHidden)
-    .filter((b) => !q || b.name.toLowerCase().includes(q) || (b.preview || "").toLowerCase().includes(q));
-  $("bot-list").innerHTML = list.map((b) => `<button class="bot-row ${b.id === activeId ? "active" : ""}" data-id="${b.id}">
-      ${avatar(b.color, b.shape, 52)}
-      <div class="meta"><div class="name">${esc(b.name)}</div>
-        <div class="preview">${b.working ? `<em>${esc(b.status || "Working")}…</em>` : esc(b.preview || "")}</div></div>
-      ${b.unread && b.id !== activeId ? '<span class="unread"></span>' : ""}
-    </button>`).join("") || (showHidden ? '<div class="empty">No hidden Bots.</div>' : "");
+  const members = new Map();
+  const teamIds = new Set(teams.map((team) => team.id));
+  for (const b of bots) {
+    if (b.hidden !== showHidden || (q && !b.name.toLowerCase().includes(q) && !(b.preview || "").toLowerCase().includes(q))) continue;
+    const id = teamIds.has(b.teamId) ? b.teamId : "unassigned";
+    if (!members.has(id)) members.set(id, []);
+    members.get(id).push(b);
+  }
+  const groups = [...teams, { id: "unassigned", name: "Unassigned" }];
+  const html = groups.filter((t) => members.has(t.id) || (!q && !showHidden))
+    .map((t) => renderTeamSection(t.id, t.name, members.get(t.id) || [], Boolean(q))).join("")
+    || (showHidden ? '<div class="empty">No hidden Bots.</div>' : '<div class="empty">No matching Bots.</div>');
+  if (html !== sidebarContent) {
+    const nav = $("bot-list");
+    const focus = document.activeElement;
+    const key = nav.contains(focus) && ["id", "teamToggle", "teamEdit"].find((key) => focus.dataset[key]);
+    sidebarContent = html;
+    nav.innerHTML = html;
+    if (key) Array.from(nav.querySelectorAll("button")).find((el) => el.dataset[key] === focus.dataset[key])?.focus({ preventScroll: true });
+  }
 
   const hidden = bots.filter((b) => b.hidden).length;
   $("hidden-label").textContent = showHidden ? "Back to Bots" : "Hidden Bots";
@@ -129,7 +156,11 @@ function renderSidebar() {
 
 // Chat
 const ACTIONS = `<div class="actions">
-  <button title="Copy" data-act="copy"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg></button>
+  <button type="button" title="Copy response" aria-label="Copy response" data-act="copy">
+    <svg aria-hidden="true" class="copy-icon" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg>
+    <svg aria-hidden="true" class="copy-check" viewBox="0 0 24 24"><path d="m5 12 4 4 10-10"/></svg>
+    <svg aria-hidden="true" class="copy-failed" viewBox="0 0 24 24"><path d="M12 5v9m0 4h.01"/></svg>
+  </button>
 </div>`;
 
 function when(ts) {
@@ -143,17 +174,16 @@ function when(ts) {
   return `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
 }
 
-function renderMessage(m, prev) {
-  let out = !prev || m.at - prev.at > 30 * 60000 ? `<div class="timestamp">${when(m.at)}</div>` : "";
+function renderMessage(m, timestamp, from) {
+  let out = timestamp ? `<div class="timestamp">${when(m.at)}</div>` : "";
   if (m.role === "routine") return out + `<div class="timestamp routine">Routine · ${esc(m.text)}</div>`;
   if (m.role === "peer" || m.role === "reply") {
-    const who = bot(m.fromBot)?.name || "another Bot";
-    const label = m.role === "peer" ? `From ${esc(who)}` : `Reply from ${esc(who)}`;
-    return out + `<div class="msg-row peer"><div class="bubble"><div class="from">${label}</div>${md(m.text)}</div></div>`;
+    const label = m.role === "peer" ? `From ${esc(from)}` : `Reply from ${esc(from)}`;
+    return out + `<div class="msg-row peer"><div class="bubble"><div class="from">${label}</div><div class="markdown">${md(m.text)}</div></div></div>`;
   }
   if (m.role === "user") return out + `<div class="msg-row user"><div class="bubble">${esc(m.text).replace(/\n/g, "<br>")}</div></div>`;
   if (m.text) {
-    out += `<div class="msg-row bot" data-id="${m.id}"><div class="bubble ${m.error ? "error" : ""}">${md(m.text)}</div>${ACTIONS}</div>`;
+    out += `<div class="msg-row bot" data-id="${m.id}"><div class="bubble markdown ${m.error ? "error" : ""}">${md(m.text)}</div>${ACTIONS}</div>`;
   }
   if (m.question) {
     const q = m.question;
@@ -167,23 +197,98 @@ function renderMessage(m, prev) {
   return out;
 }
 
-function renderChat(keepScroll) {
-  const b = bot(activeId);
-  if (!b) { $("messages").innerHTML = ""; return; }
+let historyBot;
+const historyEntries = new Map();
+
+function renderHistory(b) {
+  const history = $("chat-history");
+  if (historyBot !== b.id) {
+    historyBot = b.id;
+    historyEntries.clear();
+    history.replaceChildren();
+  }
+  let cursor = history.firstElementChild;
+  let previous;
+  for (const message of messages[b.id] || []) {
+    const timestamp = !previous || message.at - previous.at > 30 * 60000;
+    const from = bot(message.fromBot)?.name || "another Bot";
+    const question = message.question ? JSON.stringify(message.question) : "";
+    let entry = historyEntries.get(message.id);
+    if (!entry) {
+      const node = document.createElement("div");
+      node.className = "chat-entry";
+      node.dataset.message = message.id;
+      entry = { node };
+      historyEntries.set(message.id, entry);
+    }
+    if (entry.text !== message.text || entry.timestamp !== timestamp || entry.from !== from || entry.question !== question) {
+      entry.node.innerHTML = renderMessage(message, timestamp, from);
+      Object.assign(entry, { text: message.text, timestamp, from, question });
+    }
+    if (entry.node !== cursor) history.insertBefore(entry.node, cursor);
+    cursor = entry.node.nextElementSibling;
+    previous = message;
+  }
+  while (cursor) {
+    const next = cursor.nextElementSibling;
+    historyEntries.delete(Number(cursor.dataset.message));
+    cursor.remove();
+    cursor = next;
+  }
+}
+
+let draftBot;
+let draftText = "";
+let draftTimer;
+let draftWaiting = false;
+
+function renderDraft(b) {
+  const text = b.working ? drafts[b.id] || "" : "";
+  if (draftBot === b.id && draftText === text) return;
+  const body = $("draft-body");
+  const selection = window.getSelection();
+  if (text && draftBot === b.id && (body.contains(document.activeElement)
+    || (selection.rangeCount && !selection.isCollapsed && selection.getRangeAt(0).intersectsNode(body)))) {
+    draftWaiting = true;
+    return;
+  }
+  draftWaiting = false;
+  const scrollers = ".markdown-table, .markdown-code pre";
+  const offsets = draftBot === b.id ? Array.from(body.querySelectorAll(scrollers), (el) => el.scrollLeft) : [];
+  draftBot = b.id;
+  draftText = text;
+  body.innerHTML = text ? md(text) : "";
+  body.querySelectorAll(scrollers).forEach((el, i) => { if (offsets[i]) el.scrollLeft = offsets[i]; });
+  $("chat-draft").hidden = !text;
+}
+
+function scheduleDraft() {
+  if (draftTimer) return;
+  draftTimer = setTimeout(() => {
+    draftTimer = undefined;
+    const b = bot(activeId);
+    if (b) updateConversationScroll(true, () => renderDraft(b));
+  }, 75);
+}
+
+function updateConversationScroll(keepScroll, draw) {
   const el = $("messages");
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  draw();
+  if (!keepScroll || atBottom) scrollToBottom(); else updateScrollBtn();
+}
+
+function renderChat(keepScroll) {
+  const b = bot(activeId);
+  if (!b) return;
   $("bot-pill").innerHTML = `${avatar(b.color, b.shape, 30)}<span>${esc(b.name)}</span><span class="harness">${esc(b.harness === "custom" ? HARNESS_NAMES.custom : b.harness)}</span>`;
   $("input").placeholder = `Message ${b.name}`;
-  const list = messages[b.id] || [];
-  let html = list.map((m, i) => renderMessage(m, list[i - 1])).join("");
-  if (b.working) {
-    const draft = drafts[b.id];
-    if (draft) html += `<div class="msg-row bot"><div class="bubble">${md(draft)}</div></div>`;
-    html += `<div class="msg-row bot"><div class="bubble typing"><span></span><span></span><span></span>
-      <em class="status">${esc(b.status || "Working")}</em><button class="stop" id="stop">Stop</button></div></div>`;
-  }
-  el.innerHTML = html;
-  if (!keepScroll || atBottom) scrollToBottom(); else updateScrollBtn();
+  updateConversationScroll(keepScroll, () => {
+    renderHistory(b);
+    renderDraft(b);
+    $("chat-progress").hidden = !b.working;
+    $("chat-status").textContent = b.status || "Working";
+  });
 }
 
 function scrollToBottom() {
@@ -231,7 +336,8 @@ function render(keepScroll) {
   renderSidebar();
   renderChat(keepScroll);
   renderModelBar();
-  if (details.open && document.activeElement?.id !== "d-name") renderDetails();
+  if (details.open && !["d-name", "d-team"].includes(document.activeElement?.id)) renderDetails();
+  if ($("team-dialog").open) renderTeamDelete();
 }
 
 // Model and effort picker above the input. Saved on the Bot, so each Bot keeps its own.
@@ -365,8 +471,14 @@ function connect() {
     } else if (e.type === "botDeleted") {
       bots = bots.filter((b) => b.id !== e.botId);
       if (activeId === e.botId) return void open(primary()?.id);
+    } else if (e.type === "team") {
+      upsertTeam(e.team);
+    } else if (e.type === "teamDeleted") {
+      teams = teams.filter((team) => team.id !== e.teamId);
     } else if (e.type === "draft") {
       drafts[e.botId] = e.text;
+      if (e.botId === activeId) scheduleDraft();
+      return;
     } else if (e.type === "status") {
       const b = bot(e.botId);
       if (b) { b.working = e.working; b.status = e.status; }
@@ -384,24 +496,104 @@ async function load(refresh) {
   me = state.me;
   harnesses = state.harnesses;
   defaultHarness = state.defaultHarness;
+  teams = (state.teams || []).sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
   bots = state.bots;
+  for (const b of bots) drafts[b.id] = b.draft || "";
   if (refresh) for (const id of Object.keys(messages)) messages[id] = await api("GET", `/api/bots/${id}/messages`);
   await open(activeId);
 }
 
 // Events
 $("bot-list").addEventListener("click", (e) => {
+  const toggle = e.target.closest("[data-team-toggle]");
+  if (toggle) {
+    const key = collapsePrefix + toggle.dataset.teamToggle;
+    if (toggle.getAttribute("aria-expanded") === "true") localStorage.setItem(key, "true");
+    else localStorage.removeItem(key);
+    return renderSidebar();
+  }
+  const manage = e.target.closest("[data-team-edit]");
+  if (manage) return openTeamDialog(manage.dataset.teamEdit);
   const row = e.target.closest(".bot-row");
   if (row) open(row.dataset.id);
 });
+window.addEventListener("storage", (e) => {
+  if (!e.key || e.key.startsWith(collapsePrefix)) renderSidebar();
+});
 $("primary-bot").addEventListener("click", () => open(primary()?.id));
+
+let editingTeamId;
+let savingTeam = false;
+
+function renderTeamDelete() {
+  const hasMembers = bots.some((bot) => bot.teamId === editingTeamId);
+  $("team-delete").hidden = !editingTeamId || hasMembers;
+  $("team-delete-hint").hidden = !editingTeamId || !hasMembers;
+}
+
+function openTeamDialog(id) {
+  const team = id ? teams.find((team) => team.id === id) : null;
+  if (id && !team) return;
+  editingTeamId = id;
+  $("team-title").textContent = team ? "Manage team" : "New team";
+  $("team-save").textContent = team ? "Save" : "Create";
+  $("team-name").value = team?.name || "";
+  $("team-error").hidden = true;
+  renderTeamDelete();
+  $("team-dialog").showModal();
+  $("team-name").select();
+}
+
+async function saveTeam(remove = false) {
+  if (savingTeam) return;
+  const id = editingTeamId;
+  savingTeam = true;
+  $("team-save").disabled = $("team-delete").disabled = $("team-cancel").disabled = true;
+  $("team-error").hidden = true;
+  try {
+    if (remove) {
+      await api("DELETE", `/api/teams/${id}`);
+      teams = teams.filter((team) => team.id !== id);
+      localStorage.removeItem(collapsePrefix + id);
+    } else {
+      const name = $("team-name").value.trim();
+      const team = await api(id ? "PATCH" : "POST", id ? `/api/teams/${id}` : "/api/teams", { name });
+      upsertTeam(team);
+    }
+    render(true);
+    $("team-dialog").close();
+  } catch (err) {
+    $("team-error").textContent = err.message;
+    $("team-error").hidden = false;
+  } finally {
+    savingTeam = false;
+    $("team-save").disabled = $("team-delete").disabled = $("team-cancel").disabled = false;
+  }
+}
+
+$("new-team").addEventListener("click", () => openTeamDialog());
+$("team-cancel").addEventListener("click", () => $("team-dialog").close());
+$("team-delete").addEventListener("click", () => saveTeam(true));
+$("team-form").addEventListener("submit", (e) => { e.preventDefault(); saveTeam(); });
+$("team-dialog").addEventListener("cancel", (e) => { if (savingTeam) e.preventDefault(); });
+$("team-dialog").addEventListener("close", () => {
+  if (document.activeElement !== document.body && !$("team-dialog").contains(document.activeElement)) return;
+  const manage = Array.from($("bot-list").querySelectorAll("[data-team-edit]"))
+    .find((el) => el.dataset.teamEdit === editingTeamId);
+  (manage || $("new-team")).focus({ preventScroll: true });
+});
 
 $("messages").addEventListener("click", (e) => {
   if (e.target.closest("#stop")) return void api("POST", `/api/bots/${activeId}/stop`).catch(() => {});
   const copy = e.target.closest('[data-act="copy"]');
   if (copy) {
     const m = messages[activeId]?.find((x) => x.id === +copy.closest(".msg-row").dataset.id);
-    if (m) navigator.clipboard.writeText(m.text);
+    if (m) void copyText(copy, m.text);
+    return;
+  }
+  const code = e.target.closest(".copy-code");
+  if (code) {
+    void copyText(code, code.closest(".markdown-code").querySelector("pre code").textContent);
     return;
   }
   if (e.target.closest(".open-screen")) return void openScreen();
@@ -414,6 +606,9 @@ $("messages").addEventListener("click", (e) => {
   render(true);
   sendText(m.question.options[m.question.picked], { messageId: m.id, option: m.question.picked });
 });
+
+document.addEventListener("selectionchange", () => { if (draftWaiting) scheduleDraft(); });
+$("chat-draft").addEventListener("focusout", () => { if (draftWaiting) scheduleDraft(); });
 
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -510,6 +705,7 @@ function renderDetails() {
   const el = $("details");
   const b = bot(activeId);
   el.hidden = !details.open || !b;
+  $("bot-pill").setAttribute("aria-expanded", String(!el.hidden));
   if (el.hidden) return;
   const toggle = (on, attrs) => `<button type="button" class="switch ${on ? "on" : ""}" ${attrs}><span></span></button>`;
   const routines = details.routines.length
@@ -535,6 +731,9 @@ function renderDetails() {
     <div class="d-card">
       <label class="d-item"><span class="d-text">Runs on</span>
         <select id="d-harness">${list.map((h) => `<option value="${h}" ${h === b.harness ? "selected" : ""}>${HARNESS_NAMES[h] || h}</option>`).join("")}</select></label>
+      <label class="d-item"><span class="d-text">Team</span>
+        <select id="d-team"><option value="">Unassigned</option>${teams.map((team) =>
+          `<option value="${team.id}" ${team.id === b.teamId ? "selected" : ""}>${esc(team.name)}</option>`).join("")}</select></label>
       <div class="d-item"><span class="d-text">Hide from sidebar</span>${toggle(b.hidden, 'id="d-hide"')}</div>
     </div>
     ${b.primary ? "" : `<div class="d-card"><button class="d-item d-link d-danger" id="d-delete">${ICONS.trash}<span>Delete Bot</span></button></div>`}`;
@@ -574,7 +773,18 @@ $("details").addEventListener("click", async (e) => {
     }
   }
 });
-$("details").addEventListener("change", (e) => { if (e.target.id === "d-harness") patchBot({ harness: e.target.value }); });
+$("details").addEventListener("change", async (e) => {
+  if (e.target.id === "d-harness") return patchBot({ harness: e.target.value });
+  if (e.target.id !== "d-team") return;
+  const id = activeId;
+  try {
+    upsertBot(await api("PUT", `/api/bots/${id}/team`, { teamId: e.target.value || null }));
+    render(true);
+  } catch (err) {
+    e.target.value = bot(id)?.teamId || "";
+    alert(err.message);
+  }
+});
 $("details").addEventListener("keydown", (e) => { if (e.target.id === "d-name" && e.key === "Enter") e.target.blur(); });
 $("details").addEventListener("focusout", (e) => {
   if (e.target.id !== "d-name") return;
@@ -582,7 +792,7 @@ $("details").addEventListener("focusout", (e) => {
   if (name && name !== bot(activeId)?.name) patchBot({ name });
   else e.target.value = bot(activeId)?.name ?? "";
 });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && details.open && $("nb").hidden) closeDetails(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && details.open && $("nb").hidden && !$("team-dialog").open) closeDetails(); });
 
 $("hidden-btn").addEventListener("click", () => { showHidden = !showHidden; renderSidebar(); });
 $("search-btn").addEventListener("click", () => {
@@ -595,4 +805,4 @@ $("messages").addEventListener("scroll", updateScrollBtn);
 $("scroll-down").addEventListener("click", () => $("messages").scrollTo({ top: $("messages").scrollHeight, behavior: "smooth" }));
 window.addEventListener("focus", () => { markRead(); renderSidebar(); });
 
-load().then(connect).catch((err) => { $("messages").innerHTML = `<div class="timestamp">Can't reach the server: ${esc(err.message)}</div>`; });
+load().then(connect).catch((err) => { $("chat-history").innerHTML = `<div class="timestamp">Can't reach the server: ${esc(err.message)}</div>`; });

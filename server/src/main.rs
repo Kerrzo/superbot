@@ -109,7 +109,10 @@ async fn main() {
         .route("/events", get(events))
         .route("/harnesses/{name}/models", get(list_models))
         .route("/bots", get(list_bots).post(create_bot))
+        .route("/teams", post(create_team))
+        .route("/teams/{id}", patch(rename_team).delete(delete_team))
         .route("/bots/{id}", patch(update_bot).delete(delete_bot))
+        .route("/bots/{id}/team", axum::routing::put(assign_team))
         .route("/bots/{id}/messages", get(list_messages).post(send_message))
         .route("/bots/{id}/read", post(mark_read))
         .route("/bots/{id}/stop", post(stop_bot))
@@ -222,10 +225,14 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 
 async fn web(uri: axum::http::Uri) -> Response {
     let path = uri.path();
-    let file = match path {
-        "/" | "/index.html" => "index.html",
-        "/app.js" => "app.js",
-        "/styles.css" => "styles.css",
+    let (file, embedded) = match path {
+        "/" | "/index.html" => ("index.html", include_str!("../../web/index.html")),
+        "/app.js" => ("app.js", include_str!("../../web/app.js")),
+        "/styles.css" => ("styles.css", include_str!("../../web/styles.css")),
+        "/markdown.js" => ("markdown.js", include_str!("../../web/markdown.js")),
+        "/vendor/marked.js" => ("vendor/marked.js", include_str!("../../web/vendor/marked.js")),
+        "/vendor/purify.js" => ("vendor/purify.js", include_str!("../../web/vendor/purify.js")),
+        "/vendor/highlight.js" => ("vendor/highlight.js", include_str!("../../web/vendor/highlight.js")),
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
     let kind = match file.rsplit('.').next() {
@@ -235,12 +242,7 @@ async fn web(uri: axum::http::Uri) -> Response {
     };
     let body = match WEB_DIR.get().unwrap() {
         Some(dir) => std::fs::read_to_string(dir.join(file)).unwrap_or_default(),
-        None => match file {
-            "index.html" => include_str!("../../web/index.html"),
-            "app.js" => include_str!("../../web/app.js"),
-            _ => include_str!("../../web/styles.css"),
-        }
-        .to_string(),
+        None => embedded.to_owned(),
     };
     ([(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, "no-cache")], body).into_response()
 }
@@ -267,6 +269,7 @@ async fn state(State(app): State<AppState>) -> Json<Value> {
         "me": { "name": env("USER_NAME", "You") },
         "harnesses": harnesses,
         "defaultHarness": app.cfg.default_harness,
+        "teams": app.db.teams(),
         "bots": bots,
     }))
 }
@@ -286,6 +289,60 @@ async fn list_models(State(app): State<AppState>, Path(name): Path<String>) -> R
 
 async fn list_bots(State(app): State<AppState>) -> Json<Value> {
     Json(app.db.bots().iter().map(|b| app.bot_view(b)).collect())
+}
+
+fn team_name(v: &Value) -> Res<String> {
+    v["name"].as_str().map(str::trim).filter(|name| !name.is_empty() && name.chars().count() <= 60)
+        .map(str::to_owned).ok_or_else(|| bad("Enter a team name of 1 to 60 characters"))
+}
+
+fn team_db_error(_: rusqlite::Error) -> ApiError {
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the team change".into())
+}
+
+fn is_foreign_key_error(error: &rusqlite::Error) -> bool {
+    matches!(error, rusqlite::Error::SqliteFailure(code, _) if
+        code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+            || code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER)
+}
+
+async fn create_team(State(app): State<AppState>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+    let team = app.db.create_team(team_name(&v)?).map_err(team_db_error)?;
+    app.send(json!({ "type": "team", "team": team }));
+    Ok((StatusCode::CREATED, Json(json!(team))))
+}
+
+async fn rename_team(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    let team = app.db.rename_team(id, team_name(&v)?).map_err(team_db_error)?
+        .ok_or_else(|| not_found("Team"))?;
+    app.send(json!({ "type": "team", "team": team }));
+    Ok(Json(json!(team)))
+}
+
+async fn delete_team(State(app): State<AppState>, Path(id): Path<String>) -> Res {
+    let deleted = app.db.delete_empty_team(&id).map_err(|error| {
+        if is_foreign_key_error(&error) {
+            ApiError(StatusCode::CONFLICT, "Move this team's bots before deleting it".into())
+        } else { team_db_error(error) }
+    })?;
+    if !deleted { return Err(not_found("Team")); }
+    app.send(json!({ "type": "teamDeleted", "teamId": id }));
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn assign_team(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    let team = match v.get("teamId") {
+        Some(Value::Null) => None,
+        Some(Value::String(team)) => Some(team.as_str()),
+        _ => return Err(bad("teamId must be a team ID or null")),
+    };
+    if !app.db.assign_team(&id, team).map_err(|error| {
+        if is_foreign_key_error(&error) { not_found("Team") } else { team_db_error(error) }
+    })? {
+        return Err(not_found("Bot"));
+    }
+    app.push_bot(&id);
+    Ok(Json(app.bot_view(&need_bot(&app, &id)?)))
 }
 
 fn need_bot(app: &App, id: &str) -> Res<db::Bot> {

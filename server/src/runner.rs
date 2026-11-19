@@ -77,7 +77,7 @@ impl App {
         });
         let mut v = json!({
             "id": b.id, "name": b.name, "color": b.color, "shape": b.shape, "harness": b.harness, "model": b.model, "effort": b.effort,
-            "primary": b.primary, "hidden": b.hidden, "unread": b.unread, "preview": preview.unwrap_or_default(), "working": false,
+            "primary": b.primary, "hidden": b.hidden, "unread": b.unread, "teamId": b.team_id, "preview": preview.unwrap_or_default(), "working": false,
         });
         if let Some(run) = self.state().get(&b.id).and_then(|s| s.run.as_ref()) {
             v["working"] = json!(true);

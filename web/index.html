@@ -21,7 +21,13 @@
 
       <button class="primary-bot" id="primary-bot"></button>
 
-      <nav class="bot-list" id="bot-list"></nav>
+      <div class="teams-heading">
+        <span>Teams</span>
+        <button type="button" id="new-team" class="team-icon" title="New team" aria-label="New team">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+      <nav class="bot-list" id="bot-list" aria-label="Bots by team"></nav>
 
       <button class="hidden-bots" id="hidden-btn">
         <span id="hidden-label">Hidden Bots</span><span id="hidden-count"></span>
@@ -40,12 +46,19 @@
 
     <main class="chat">
       <header class="chat-header">
-        <div class="bot-pill" id="bot-pill"></div>
+        <button type="button" class="bot-pill" id="bot-pill" aria-controls="details" aria-expanded="false"></button>
         <button class="share-btn screen-btn" id="screen-btn" title="Watch this Bot's screen">Screen</button>
         <button class="share-btn">Share</button>
       </header>
 
-      <section class="messages" id="messages"></section>
+      <section class="messages" id="messages" aria-label="Conversation">
+        <div class="chat-history" id="chat-history"></div>
+        <div class="msg-row bot" id="chat-draft" hidden><div class="bubble markdown" id="draft-body"></div></div>
+        <div class="msg-row bot" id="chat-progress" hidden><div class="bubble typing"><span></span><span></span><span></span>
+          <em class="status" id="chat-status"></em><button class="stop" id="stop">Stop</button>
+        </div></div>
+      </section>
+      <div id="copy-status" role="status" class="copy-status"></div>
 
       <button class="scroll-down" id="scroll-down" title="Scroll to bottom">
         <svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
@@ -111,6 +124,26 @@
       </div>
     </form>
   </div>
+  <dialog class="modal team-dialog" id="team-dialog" aria-labelledby="team-title">
+    <form id="team-form">
+      <div class="modal-head"><h3 id="team-title">New team</h3></div>
+      <div class="team-form-body">
+        <label for="team-name">Team name</label>
+        <input id="team-name" maxlength="60" required autofocus autocomplete="off" />
+        <p id="team-delete-hint" hidden>Move this team’s bots before deleting it.</p>
+        <p class="nb-error" id="team-error" role="alert" hidden></p>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="nb-btn team-delete" id="team-delete" hidden>Delete team</button>
+        <button type="button" class="nb-btn" id="team-cancel">Cancel</button>
+        <button type="submit" class="nb-btn primary" id="team-save">Create</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="vendor/marked.js"></script>
+  <script src="vendor/purify.js"></script>
+  <script src="vendor/highlight.js"></script>
+  <script src="markdown.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

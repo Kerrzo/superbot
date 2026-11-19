@@ -15,6 +15,7 @@ pub struct Bot {
     pub harness: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub team_id: Option<String>,
     #[serde(skip)]
     pub session_id: Option<String>,
     pub primary: bool,
@@ -56,6 +57,12 @@ pub struct Routine {
     pub created_at: i64,
 }
 
+#[derive(Serialize)]
+pub struct Team {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Default)]
 pub struct BotPatch {
     pub name: Option<String>,
@@ -84,6 +91,7 @@ fn bot_row(r: &Row) -> rusqlite::Result<Bot> {
         harness: r.get("harness")?,
         model: r.get("model")?,
         effort: r.get("effort")?,
+        team_id: r.get("team_id")?,
         session_id: r.get("session_id")?,
         primary: r.get("primary_bot")?,
         hidden: r.get("hidden")?,
@@ -122,10 +130,14 @@ fn routine_row(r: &Row) -> rusqlite::Result<Routine> {
 
 impl Db {
     pub fn open(path: &std::path::Path) -> rusqlite::Result<Db> {
-        let c = Connection::open(path)?;
+        let mut c = Connection::open(path)?;
         c.execute_batch(
             "PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS teams (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS bots (
               id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
@@ -164,11 +176,47 @@ impl Db {
         // Added after the first release; fails harmlessly if it already exists.
         let _ = c.execute("ALTER TABLE messages ADD COLUMN from_bot TEXT", []);
         let _ = c.execute("ALTER TABLE bots ADD COLUMN effort TEXT", []);
+        let migration = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_team: bool = migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name = 'team_id')", [], |r| r.get(0),
+        )?;
+        if !has_team {
+            migration.execute("ALTER TABLE bots ADD COLUMN team_id TEXT REFERENCES teams(id) ON DELETE RESTRICT", [])?;
+        }
+        migration.execute("CREATE INDEX IF NOT EXISTS bots_team ON bots(team_id)", [])?;
+        migration.commit()?;
         Ok(Db(Mutex::new(c)))
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn teams(&self) -> Vec<Team> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT id, name FROM teams ORDER BY name COLLATE NOCASE, id").unwrap();
+        s.query_map([], |r| Ok(Team { id: r.get(0)?, name: r.get(1)? }))
+            .unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn create_team(&self, name: String) -> rusqlite::Result<Team> {
+        let id = crate::short_id();
+        self.c().execute("INSERT INTO teams (id, name) VALUES (?, ?)", params![id, name])?;
+        Ok(Team { id, name })
+    }
+
+    pub fn rename_team(&self, id: String, name: String) -> rusqlite::Result<Option<Team>> {
+        let changed = self.c().execute("UPDATE teams SET name = ? WHERE id = ?", params![name, id])?;
+        Ok((changed > 0).then_some(Team { id, name }))
+    }
+
+    pub fn delete_empty_team(&self, id: &str) -> rusqlite::Result<bool> {
+        self.c().execute("DELETE FROM teams WHERE id = ?", [id]).map(|changed| changed > 0)
+    }
+
+    pub fn assign_team(&self, bot_id: &str, team_id: Option<&str>) -> rusqlite::Result<bool> {
+        self.c().execute("UPDATE bots SET team_id = ? WHERE id = ?", params![team_id, bot_id])
+            .map(|changed| changed > 0)
     }
 
     // Bots
@@ -324,5 +372,58 @@ impl Db {
 
     pub fn delete_routine(&self, id: &str) {
         self.c().execute("DELETE FROM routines WHERE id = ?", [id]).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn team_migration_and_assignment_preserve_bot_data() -> rusqlite::Result<()> {
+        let dir = std::env::temp_dir().join(format!("superbot-teams-{}", crate::adapters::new_uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let temp = Cleanup(dir);
+        let path = temp.0.join("app.sqlite");
+
+        let db = Db::open(&path)?;
+        let bot = db.create_bot("Librarian", "#ffffff", "waddle", "custom", Some("test-model"), false);
+        db.update_bot(&bot.id, BotPatch { session_id: Some(Some("session".into())), ..Default::default() });
+        let message = db.add_message(&bot.id, "bot", "Hours recorded.", None, false, None);
+        let routine = db.add_routine(&bot.id, "Check hours", "0 7 * * *", "Check today's hours.");
+        db.c().execute_batch("DROP INDEX bots_team; ALTER TABLE bots DROP COLUMN team_id; DROP TABLE teams;")?;
+        drop(db);
+
+        let db = Db::open(&path)?;
+        assert!(db.teams().is_empty());
+        assert!(db.bot(&bot.id).unwrap().team_id.is_none());
+        let first = db.create_team("Personal".into())?;
+        let second = db.create_team("Work".into())?;
+        assert!(db.assign_team(&bot.id, Some(&first.id))?);
+        assert!(db.delete_empty_team(&first.id).is_err());
+        assert!(db.assign_team(&bot.id, Some("unknown")).is_err());
+        assert_eq!(db.bot(&bot.id).unwrap().team_id.as_deref(), Some(first.id.as_str()));
+        assert!(db.assign_team(&bot.id, Some(&second.id))?);
+        let renamed = db.rename_team(second.id, "Library".into())?.unwrap();
+        assert!(db.delete_empty_team(&first.id)?);
+        drop(db);
+
+        let db = Db::open(&path)?;
+        assert_eq!(db.teams()[0].name, "Library");
+        let saved = db.bot(&bot.id).unwrap();
+        assert_eq!(saved.team_id.as_deref(), Some(renamed.id.as_str()));
+        assert_eq!(saved.harness, "custom");
+        assert_eq!(saved.model.as_deref(), Some("test-model"));
+        assert_eq!(saved.session_id.as_deref(), Some("session"));
+        assert_eq!(db.messages(&bot.id, 10)[0].id, message.id);
+        assert_eq!(db.routines(Some(&bot.id))[0].id, routine.id);
+        assert!(db.assign_team(&bot.id, None)?);
+        assert!(db.delete_empty_team(&renamed.id)?);
+        assert!(db.bot(&bot.id).unwrap().team_id.is_none());
+        Ok(())
     }
 }

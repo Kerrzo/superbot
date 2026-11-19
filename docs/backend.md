@@ -5,6 +5,7 @@ One Rust server, `botd`. It serves the web app, stores Bot and chat records in S
 ## How it works
 
 - **Bots** live in SQLite. Each Bot has a harness (`claude`, `codex`, `pi`, or `custom`), an optional model, and a CLI harness session id.
+- **Teams** group Bots in the sidebar. A Bot has one optional team assignment in SQLite. The sidebar remembers collapsed sections in the current browser.
 - **A message** is queued. Each Bot runs one task at a time, in order. Different Bots run in parallel.
 - **A run** invokes the harness, streams its events, and saves each text block as a chat bubble.
 - **Live updates** go to the browser over one Server-Sent Events stream: new messages, streaming text, and what the Bot is doing ("Running: ls").
@@ -59,10 +60,12 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 
 All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`.
 
-- `GET /api/state`: user name, installed harnesses, all Bots
-- `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `resync`)
+- `GET /api/state`: user name, installed harnesses, all Bots and teams
+- `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `team`, `teamDeleted`, `resync`)
 - `POST /api/bots` `{name, harness?, model?, color?, shape?}`
 - `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`
+- `POST /api/teams` and `PATCH /api/teams/:id` accept `{name}`. `DELETE /api/teams/:id` returns 409 while Bots are assigned.
+- `PUT /api/bots/:id/team` accepts `{teamId}`. Use `null` to move a Bot to Unassigned.
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers. For `custom`, this returns the configured default model.
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
