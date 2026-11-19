@@ -1,12 +1,12 @@
 # Backend
 
-One Rust binary, `botd`. It serves the web app, stores everything in SQLite, and runs each Bot on a coding-agent CLI.
+One Rust server, `botd`. It serves the web app, stores Bot and chat records in SQLite, and runs each Bot on its selected harness.
 
 ## How it works
 
-- **Bots** live in SQLite. Each Bot has a harness (`claude`, `codex`, or `pi`), an optional model, and a harness session id.
+- **Bots** live in SQLite. Each Bot has a harness (`claude`, `codex`, `pi`, or `custom`), an optional model, and a CLI harness session id.
 - **A message** is queued. Each Bot runs one task at a time, in order. Different Bots run in parallel.
-- **A run** spawns the harness CLI in the shared workspace, streams its JSON events, and saves each text block as a chat bubble.
+- **A run** invokes the harness, streams its events, and saves each text block as a chat bubble.
 - **Live updates** go to the browser over one Server-Sent Events stream: new messages, streaming text, and what the Bot is doing ("Running: ls").
 - **Memory** is plain files, re-sent in the system prompt every run. The Bot edits them itself:
   - `DATA_DIR/bots/<id>/MEMORY.md`: one Bot's job, rules, and work log.
@@ -20,15 +20,16 @@ One Rust binary, `botd`. It serves the web app, stores everything in SQLite, and
 
 ## Harness adapters
 
-Each adapter is one file in `server/src/adapters/`. It builds the command line and maps the CLI's JSON lines to five events: session, text delta, text, tool, error.
+CLI adapters in `server/src/adapters/` build command lines and map JSON lines to the runner's events. The native custom adapter emits the same text, tool and error events from an HTTP stream.
 
 - **Claude Code**: `claude -p --output-format stream-json --resume <id>`. System prompt via `--append-system-prompt`, fresh every run.
 - **Codex**: `codex exec --json`, then `codex exec resume <id>`. Instructions via `-c developer_instructions=...`. Codex only reads them when a session starts, so later memory edits reach it through the memory file.
 - **Pi**: `pi --mode json --session-dir <bot dir> --session-id <id>`. System prompt via `--append-system-prompt`.
+- **[Custom (OpenAI Compatible)](custom-provider.md)** uses streaming Chat Completions, stores recent conversation turns per Bot, and exposes a subset of SuperBot tools as functions.
 
 All three run with permission prompts off (`--dangerously-skip-permissions` and equivalents). The server is the computer, so treat it that way. Approvals are not built yet.
 
-Add a harness: write one adapter file and add it to `get()` and `NAMES` in `adapters/mod.rs`.
+For a new CLI harness, add an adapter file and register it in `get()`, `CLI_NAMES` and `NAMES` in `adapters/mod.rs`.
 
 ## Run it
 
@@ -62,7 +63,7 @@ All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`.
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `resync`)
 - `POST /api/bots` `{name, harness?, model?, color?, shape?}`
 - `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`
-- `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`)
+- `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers. For `custom`, this returns the configured default model.
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`

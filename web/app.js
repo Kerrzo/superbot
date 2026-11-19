@@ -172,7 +172,7 @@ function renderChat(keepScroll) {
   if (!b) { $("messages").innerHTML = ""; return; }
   const el = $("messages");
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  $("bot-pill").innerHTML = `${avatar(b.color, b.shape, 30)}<span>${esc(b.name)}</span><span class="harness">${esc(b.harness)}</span>`;
+  $("bot-pill").innerHTML = `${avatar(b.color, b.shape, 30)}<span>${esc(b.name)}</span><span class="harness">${esc(b.harness === "custom" ? HARNESS_NAMES.custom : b.harness)}</span>`;
   $("input").placeholder = `Message ${b.name}`;
   const list = messages[b.id] || [];
   let html = list.map((m, i) => renderMessage(m, list[i - 1])).join("");
@@ -250,6 +250,19 @@ async function renderModelBar() {
   if (key === modelBarKey) return;
   modelBarKey = key;
 
+  const custom = b.harness === "custom";
+  $("model-select").hidden = custom;
+  $("custom-model").hidden = !custom;
+  if (custom) {
+    const input = $("custom-model");
+    input.dataset.bot = b.id;
+    input.value = b.model || "";
+    input.placeholder = list[0]?.label || "Server default model";
+    $("effort-select").hidden = true;
+    $("model-bar").hidden = false;
+    return;
+  }
+
   const all = [...new Set(list.flatMap((m) => m.efforts))];
   const models = [{ id: "", label: "Default model", efforts: all }, ...list];
   // A Bot saved with an alias (e.g. "opus") shows as its exact model.
@@ -278,6 +291,17 @@ $("model-select").addEventListener("change", async (e) => {
   // Keep the effort only if the new model supports it.
   const effort = m && b.effort && !m.efforts.includes(b.effort) ? null : b.effort;
   saveModel({ model: e.target.value || null, effort });
+});
+
+$("custom-model").addEventListener("change", (e) => {
+  const b = bot(activeId);
+  if (b?.id === e.target.dataset.bot && b.harness === "custom") {
+    modelBarKey = "";
+    saveModel({ model: e.target.value.trim() || null });
+  }
+});
+$("custom-model").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") e.target.blur();
 });
 $("effort-select").addEventListener("change", (e) => saveModel({ effort: e.target.value || null }));
 
@@ -401,7 +425,12 @@ $("composer").addEventListener("submit", (e) => {
 
 // New Bot window
 const COLORS = ["#f5f5f5", "#9a6b3f", "#e5484d", "#e8702e", "#e9a23b", "#4cc06a", "#4fb5a5", "#3b82f6", "#8b5cf6", "#e64a9c", "#7a7a7a"];
-const HARNESS_NAMES = { claude: "Claude Code", codex: "Codex", pi: "Pi" };
+const HARNESS_NAMES = { claude: "Claude Code", codex: "Codex", pi: "Pi", custom: "Custom (OpenAI Compatible)" };
+function harnessOptions(current) {
+  const cli = harnesses.filter((h) => h !== "custom");
+  const available = cli.length ? harnesses : ["claude", "codex", "pi", ...harnesses];
+  return [...new Set([...available, current])];
+}
 const nb = { color: COLORS[0], shape: "waddle", harness: "claude" };
 const pickOne = (a) => a[Math.floor(Math.random() * a.length)];
 
@@ -411,7 +440,7 @@ function renderNewBot() {
     `<button type="button" class="nb-shape" data-shape="${s}" title="${s}">${avatar(nb.color, s, 60, s === nb.shape)}</button>`).join("");
   $("nb-colors").innerHTML = COLORS.map((c) =>
     `<button type="button" class="nb-color ${c === nb.color ? "on" : ""}" data-color="${c}" style="background:${c}" title="${c}"></button>`).join("");
-  const list = harnesses.length ? harnesses : Object.keys(HARNESS_NAMES);
+  const list = harnessOptions(nb.harness);
   $("nb-harness").innerHTML = list.map((h) =>
     `<option value="${h}" ${h === nb.harness ? "selected" : ""}>${HARNESS_NAMES[h] || h}</option>`).join("");
   $("nb-create").disabled = !$("nb-name").value.trim();
@@ -500,7 +529,7 @@ function renderDetails() {
       <div class="d-text"><div>Bot's computer</div><div class="d-sub">${b.working ? esc(b.status || "Working") : "Asleep"}</div></div>
       <div class="d-screen ${b.working ? "awake" : ""}">${avatar(b.color, b.shape, 40)}${b.working ? "" : "<i>z</i>"}</div>
     </div></div>`;
-  const list = harnesses.length ? harnesses : Object.keys(HARNESS_NAMES);
+  const list = harnessOptions(b.harness);
   const settings = `
     <div class="d-section"><span>Bot</span></div>
     <div class="d-card">

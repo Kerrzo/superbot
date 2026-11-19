@@ -22,6 +22,7 @@ pub struct Config {
     pub bot_token: String,
     pub run_timeout: Duration,
     pub default_harness: String,
+    pub custom: Option<adapters::custom::Provider>,
 }
 
 struct Run {
@@ -161,7 +162,11 @@ impl App {
     }
 
     async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) {
-        if adapters::get(&bot.harness).is_none() {
+        let is_custom = bot.harness == adapters::custom::NAME;
+        if is_custom && self.cfg.custom.is_none() {
+            return self.say(&bot.id, "Custom (OpenAI Compatible) is not configured on this server.", true);
+        }
+        if !is_custom && adapters::get(&bot.harness).is_none() {
             return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
         }
         self.init_bot_files(&bot);
@@ -192,7 +197,7 @@ impl App {
             ]);
             let path = std::env::var("PATH").unwrap_or_default();
             env.insert("PATH".into(), format!("{}:{path}", self.cfg.bin_dir.display()));
-            if let Some(screens) = &self.screens
+            if !is_custom && let Some(screens) = &self.screens
                 && let Some(info) = screens.ensure(&bot.id, |id| self.is_running(id)).await
             {
                 env.extend(screen::bot_env(&info, &bot.id, &self.bot_dir(&bot.id)));
@@ -211,7 +216,7 @@ impl App {
             let mut errors: Vec<String> = Vec::new();
             let mut replies = 0;
             let id = bot.id.clone();
-            adapters::run(adapters::get(&bot.harness).unwrap(), input, abort_rx.clone(), |e| match e {
+            let emit = |e| match e {
                 AgentEvent::Session(s) => {
                     if self.db.bot(&id).and_then(|b| b.session_id).as_deref() != Some(&s) {
                         self.db.update_bot(&id, BotPatch { session_id: Some(Some(s)), ..Default::default() });
@@ -232,8 +237,12 @@ impl App {
                     self.send(json!({ "type": "status", "botId": id, "working": true, "status": status }));
                 }
                 AgentEvent::Error(m) => errors.push(m),
-            })
-            .await;
+            };
+            if let Some(provider) = self.cfg.custom.as_ref().filter(|_| is_custom) {
+                provider.run(input, abort_rx.clone(), emit).await;
+            } else {
+                adapters::run(adapters::get(&bot.harness).unwrap(), input, abort_rx.clone(), emit).await;
+            }
             timer.abort();
             // Done running. The stream may have ended without a final block: keep what was streamed.
             let draft = self.state().get_mut(&id).and_then(|s| s.run.take()).map(|r| r.draft).unwrap_or_default();
@@ -249,7 +258,7 @@ impl App {
                     || ((m.contains("session") || m.contains("conversation"))
                         && (m.contains("not found") || m.contains("no such") || m.contains("does not exist")))
             });
-            if lost && bot.session_id.is_some() && replies == 0 && attempt == 0 {
+            if !is_custom && lost && bot.session_id.is_some() && replies == 0 && attempt == 0 {
                 self.db.update_bot(&id, BotPatch { session_id: Some(None), ..Default::default() });
                 bot.session_id = None;
                 continue;
@@ -390,18 +399,26 @@ impl App {
         } else {
             ""
         };
+        let botctl = self.cfg.bin_dir.join("botctl").display().to_string();
+        let custom = self.cfg.custom.as_ref().filter(|_| bot.harness == adapters::custom::NAME);
+        let [computer, memory, routines, ask] = if let Some(provider) = custom {
+            provider.instructions().map(str::to_owned)
+        } else {
+            [
+                format!("## Your computer\n- You run on a Linux computer shared with the user's other Bots. Your working folder is {}.\n- Files, browser sign-ins, and credentials on it are shared by all Bots. Keep durable work in clear project folders.", self.cfg.workspace.display()),
+                format!("- Your memory file: {}. It holds your job, the user's rules and preferences for you, and a short dated log of important work.\n- Shared facts about the user, used by every Bot: {}. Name, time zone, and similar.\n- Update these files yourself when you learn something lasting, without asking. Keep them short. Never store passwords, keys, or card numbers.", self.memory_file(&bot.id).display(), self.user_file().display()),
+                format!("## Routines\n- For recurring or scheduled work, use `{botctl}`. Run `{botctl} help` to see how."),
+                format!("- To ask another Bot something or hand it a task, run: {botctl} ask \"<Bot name or id>\" \"<message>\". It prints their reply. It can take minutes, so give the command a long timeout (10 minutes). If they take longer, their reply arrives later as a new message."),
+            ]
+        };
         format!(
             r#"You are {name}, an AI teammate of {user}.{primary}
 They talk to you in a chat app, like messaging a coworker. Finish work end to end.
 
-## Your computer
-- You run on a Linux computer shared with the user's other Bots. Your working folder is {ws}.
-- Files, browser sign-ins, and credentials on it are shared by all Bots. Keep durable work in clear project folders.
+{computer}
 
 ## Memory
-- Your memory file: {mem_path}. It holds your job, the user's rules and preferences for you, and a short dated log of important work.
-- Shared facts about the user, used by every Bot: {user_path}. Name, time zone, and similar.
-- Update these files yourself when you learn something lasting, without asking. Keep them short. Never store passwords, keys, or card numbers.
+{memory}
 - Current contents:
 <memory>
 {mem}
@@ -410,8 +427,7 @@ They talk to you in a chat app, like messaging a coworker. Finish work end to en
 {user_facts}
 </user>
 
-## Routines
-- For recurring or scheduled work, use `{botctl}`. Run `{botctl} help` to see how.
+{routines}
 {screen}
 ## Style
 - Reply like a teammate in chat: short, plain English. Markdown is fine.
@@ -424,18 +440,13 @@ They talk to you in a chat app, like messaging a coworker. Finish work end to en
 
 ## Other Bots
 {others}
-- To ask another Bot something or hand it a task, run: {botctl} ask "<Bot name or id>" "<message>". It prints their reply. It can take minutes, so give the command a long timeout (10 minutes). If they take longer, their reply arrives later as a new message.
+{ask}
 - Only loop in another Bot when the user asks or it clearly helps. Never ask the Bot that is asking you.
 
 Current time: {now}."#,
             name = bot.name,
-            // Full path: some harnesses run commands in a login shell that resets PATH.
-            botctl = self.cfg.bin_dir.join("botctl").display(),
-            screen = if self.screens.is_some() { screen_prompt(&self.cfg.bin_dir.join("botctl").display().to_string()) } else { String::new() },
+            screen = if custom.is_none() && self.screens.is_some() { screen_prompt(&botctl) } else { String::new() },
             user = self.cfg.user_name,
-            ws = self.cfg.workspace.display(),
-            mem_path = self.memory_file(&bot.id).display(),
-            user_path = self.user_file().display(),
             mem = read(self.memory_file(&bot.id)),
             user_facts = read(self.user_file()),
             others = if others.is_empty() { "None yet.".into() } else { others.join("\n") },

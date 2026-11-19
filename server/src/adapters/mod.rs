@@ -1,9 +1,9 @@
-//! The only contract between the server and a harness (Claude Code, Codex, Pi).
-//! Each adapter builds a command line and maps the harness's JSON lines to `AgentEvent`s.
-//! Spawning, streaming, stopping, and exit handling are shared here.
+//! Inputs and events shared by CLI adapters and the native custom provider.
+//! CLI adapters map JSON lines to `AgentEvent`s. Their process handling lives here.
 
 mod claude;
 mod codex;
+pub mod custom;
 mod pi;
 
 use serde_json::Value;
@@ -90,8 +90,9 @@ pub fn output(bin: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// To add a harness: write one adapter file and list it here.
-pub const NAMES: [&str; 3] = ["claude", "codex", "pi"];
+/// CLI adapters and accepted harness identifiers.
+const CLI_NAMES: [&str; 3] = ["claude", "codex", "pi"];
+pub const NAMES: [&str; 4] = ["claude", "codex", "pi", custom::NAME];
 
 pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
     match name {
@@ -104,7 +105,7 @@ pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
 
 /// Harnesses whose CLI is on PATH.
 pub fn installed() -> Vec<&'static str> {
-    NAMES
+    CLI_NAMES
         .into_iter()
         .filter(|n| {
             let bin = get(n).unwrap().bin();

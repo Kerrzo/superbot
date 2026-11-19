@@ -263,7 +263,12 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   max-width: 1240px; margin: 0 auto; padding-left: 14px;
   display: flex; gap: 2px;
 }
-.model-bar[hidden], .model-bar select[hidden] { display: none; }
+.model-bar[hidden], .model-bar [hidden] { display: none; }
+.model-bar input {
+  width: min(260px, 100%); background: transparent; color: var(--text);
+  border: 0; border-radius: 7px; padding: 3px 8px; font: inherit; font-size: 13px;
+}
+.model-bar input:hover, .model-bar input:focus-visible { background-color: #1f1f1f; }
 .model-bar select {
   appearance: none; field-sizing: content; max-width: 320px;
   font: inherit; font-size: 13px; color: var(--text-faint);

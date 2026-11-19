@@ -1,5 +1,5 @@
 //! botd: the server. Owns Bots, chats, memory files, and routines; runs each Bot
-//! on its harness (Claude Code, Codex, or Pi); serves the web app and its API.
+//! on its selected harness and serves the web app and its API.
 
 mod adapters;
 mod cron;
@@ -61,8 +61,16 @@ async fn main() {
         eprintln!("Refusing to listen on a public address without AUTH_PASSWORD.");
         std::process::exit(1);
     }
-    if adapters::get(&default_harness).is_none() {
+    if !adapters::NAMES.contains(&default_harness.as_str()) {
         eprintln!("DEFAULT_HARNESS must be one of: {}", adapters::NAMES.join(", "));
+        std::process::exit(1);
+    }
+    let custom = adapters::custom::Provider::from_env().unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(1);
+    });
+    if default_harness == adapters::custom::NAME && custom.is_none() {
+        eprintln!("Set CUSTOM_OPENAI_BASE_URL and CUSTOM_OPENAI_MODEL to use the custom default harness.");
         std::process::exit(1);
     }
     PASSWORD.set(password).unwrap();
@@ -86,6 +94,7 @@ async fn main() {
         bot_token: random_bytes(24).iter().map(|x| format!("{x:02x}")).collect(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
+        custom,
     }, screens);
 
     // First start: create the primary Bot.
@@ -250,16 +259,24 @@ async fn events(State(app): State<AppState>) -> impl IntoResponse {
 
 async fn state(State(app): State<AppState>) -> Json<Value> {
     let bots: Vec<Value> = app.db.bots().iter().map(|b| app.bot_view(b)).collect();
+    let mut harnesses = adapters::installed();
+    if app.cfg.custom.is_some() {
+        harnesses.push(adapters::custom::NAME);
+    }
     Json(json!({
         "me": { "name": env("USER_NAME", "You") },
-        "harnesses": adapters::installed(),
+        "harnesses": harnesses,
         "defaultHarness": app.cfg.default_harness,
         "bots": bots,
     }))
 }
 
 /// Models and reasoning efforts the harness offers on this server.
-async fn list_models(Path(name): Path<String>) -> Res {
+async fn list_models(State(app): State<AppState>, Path(name): Path<String>) -> Res {
+    if name == adapters::custom::NAME {
+        let provider = app.cfg.custom.as_ref().ok_or_else(|| not_found("Harness"))?;
+        return Ok(Json(json!([provider.default_model()])));
+    }
     if adapters::get(&name).is_none() {
         return Err(not_found("Harness"));
     }
@@ -275,7 +292,7 @@ fn need_bot(app: &App, id: &str) -> Res<db::Bot> {
     app.db.bot(id).ok_or_else(|| not_found("Bot"))
 }
 
-fn bot_patch(v: &Value) -> Res<BotPatch> {
+fn bot_patch(app: &App, v: &Value) -> Res<BotPatch> {
     let mut p = BotPatch::default();
     if let Some(n) = v["name"].as_str().map(str::trim).filter(|n| !n.is_empty()) {
         p.name = Some(n.chars().take(60).collect());
@@ -305,15 +322,18 @@ fn bot_patch(v: &Value) -> Res<BotPatch> {
         _ => {}
     }
     if let Some(h) = v.get("harness") {
-        let h = h.as_str().filter(|h| adapters::get(h).is_some());
+        let h = h.as_str().filter(|h| adapters::NAMES.contains(h));
         let h = h.ok_or_else(|| bad(format!("Harness must be one of: {}", adapters::NAMES.join(", "))))?;
+        if h == adapters::custom::NAME && app.cfg.custom.is_none() {
+            return Err(bad("Custom (OpenAI Compatible) is not configured on this server"));
+        }
         p.harness = Some(h.into());
     }
     Ok(p)
 }
 
 async fn create_bot(State(app): State<AppState>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
-    let p = bot_patch(&v)?;
+    let p = bot_patch(&app, &v)?;
     let name = p.name.ok_or_else(|| bad("Name is required"))?;
     let harness = p.harness.unwrap_or_else(|| app.cfg.default_harness.clone());
     let bot = app.db.create_bot(
@@ -331,9 +351,13 @@ async fn create_bot(State(app): State<AppState>, Json(v): Json<Value>) -> Res<(S
 
 async fn update_bot(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let bot = need_bot(&app, &id)?;
-    let mut p = bot_patch(&v)?;
-    if p.harness.as_ref().is_some_and(|h| *h != bot.harness) {
+    let mut p = bot_patch(&app, &v)?;
+    if let Some(harness) = p.harness.as_deref().filter(|h| *h != bot.harness) {
         p.session_id = Some(None); // sessions don't carry across harnesses
+        if harness == adapters::custom::NAME || bot.harness == adapters::custom::NAME {
+            p.model.get_or_insert(None);
+            p.effort.get_or_insert(None);
+        }
     }
     app.db.update_bot(&id, p);
     app.push_bot(&id);
